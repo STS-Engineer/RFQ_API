@@ -1,67 +1,109 @@
-import json
+import os
+import psycopg2
+from psycopg2 import OperationalError, errorcodes, extras
 from flask import Flask, request, jsonify
-# Import psycopg2 for PostgreSQL connection
-import psycopg2 
-from psycopg2 import extras
-from psycopg2 import Error as Psycopg2Error
 
-# --- Configuration ---
-app = Flask(__name__)
-app.config['JSON_SORT_KEYS'] = False
-
-# TODO: REPLACE WITH YOUR ACTUAL POSTGRESQL CREDENTIALS
+# --- 1. CONFIGURATION ---
+# IMPORTANT: Replace these placeholders with your actual PostgreSQL credentials.
 DB_CONFIG = {
     "host": "avo-adb-002.postgres.database.azure.com",
     "database": "RFQ_DATA",
     "user": "administrationSTS",
     "password": "St$@0987"
 }
-# --- Database Connection and Utility Functions ---
+
+app = Flask(__name__)
+
+# --- 2. DATABASE CONNECTION UTILITY ---
 
 def get_db():
-    """Returns a PostgreSQL database connection."""
+    """Returns a PostgreSQL database connection and a RealDictCursor."""
+    conn = None
     try:
         # Establish connection using the configuration dictionary
         conn = psycopg2.connect(**DB_CONFIG)
-        # Set the row factory to return dictionaries (useful for jsonify)
+        # Set the row factory to return dictionaries
         cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
         return conn, cursor
-    except Psycopg2Error as e:
+    except OperationalError as e:
+        # Log the specific connection failure
         print(f"PostgreSQL connection failed: {e}")
-        # Raise the error to be handled by the API endpoint
+        # Re-raise the error to be handled by the API endpoint caller
+        if conn:
+            conn.close()
+        # Use str(e) as a fallback if e.pgerror is not available (common in connection errors)
+        error_message = f"Database connection failed: {str(e)}"
+        raise ConnectionError(error_message)
+    except Exception as e:
+        if conn:
+            conn.close()
         raise e
 
 
-# NOTE: init_db() function and its call are REMOVED 
-# as the user confirmed the database structure is already created.
-
-# --- API Endpoint: Submit Data ---
+# --- 3. API ENDPOINTS ---
 
 @app.route('/api/rfq/submit', methods=['POST'])
 def submit_rfq_data():
-    """
-    Receives RFQ data via POST request and inserts it into
-    the 'main' and 'contact' database tables using PostgreSQL.
-    """
+    """Receives structured RFQ data and inserts it into the main and contact tables."""
+    data = request.get_json()
     conn = None
-    cursor = None
-    rfq_id = None # Initialize rfq_id outside try block for better scope visibility
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"status": "error", "message": "No JSON data provided"}), 400
-            
-        # 1. Use RFQ ID provided in the payload (as per new requirement)
-        rfq_id = data.get('rfq_id')
-        if not rfq_id:
-            return jsonify({"status": "error", "message": "Missing required field: rfq_id"}), 400
+    rfq_id = None
+    
+    if not data:
+        return jsonify({"status": "error", "message": "No data provided"}), 400
 
-        # 2. Establish connection
+    rfq_id = data.get('rfq_id')
+    if not rfq_id:
+        return jsonify({"status": "error", "message": "Missing required field: rfq_id"}), 400
+
+    try:
+        # 1. Establish connection
         conn, cursor = get_db()
         
-        # 3. Extract and prepare main data fields
-        # Note: We use 1/0 for boolean in the data preparation, 
-        # but Psycopg2 handles Python's True/False correctly for PostgreSQL BOOLEAN.
+        # Start transaction block
+        
+        # --- CONTACT HANDLING (1:N Relationship) ---
+        contact_data = data.get('contact', {})
+        contact_email = contact_data.get('email')
+        
+        if not contact_email:
+            conn.close()
+            return jsonify({"status": "error", "message": "Missing required contact field: email"}), 400
+
+        contact_id_fk = None
+
+        # A. Try to find existing contact by email
+        cursor.execute(
+            "SELECT contact_id FROM contact WHERE contact_email = %s", 
+            (contact_email,)
+        )
+        existing_contact = cursor.fetchone()
+
+        if existing_contact:
+            # Contact found, use existing ID
+            contact_id_fk = existing_contact['contact_id']
+        else:
+            # B. Contact not found, insert new contact and retrieve its new ID
+            insert_contact_sql = """
+            INSERT INTO contact (contact_role, contact_email, contact_phone)
+            VALUES (%s, %s, %s)
+            RETURNING contact_id;
+            """
+            cursor.execute(
+                insert_contact_sql,
+                (
+                    contact_data.get('role'),
+                    contact_data.get('email'),
+                    contact_data.get('phone')
+                )
+            )
+            # Fetch the ID generated by SERIAL
+            contact_id_fk = cursor.fetchone()['contact_id']
+
+        # --- MAIN RFQ INSERTION ---
+
+        # 2. Prepare main data fields
+        # Note: Psycopg2 handles Python's True/False correctly for PostgreSQL BOOLEAN.
         main_fields = {
             'rfq_id': rfq_id,
             'customer_name': data.get('customer_name'),
@@ -88,127 +130,67 @@ def submit_rfq_data():
             'validation_responsibility': data.get('validation_responsibility'),
             'design_ownership': data.get('design_ownership'),
             'development_costs': data.get('development_costs'),
-            # Convert string representations to Python Booleans for PostgreSQL
-            'technical_capacity': data.get('technical_capacity', '').lower() == 'yes',
-            'scope_alignment': data.get('scope_alignment', '').lower() == 'yes',
+            'technical_capacity': data.get('technical_capacity', 'maybe').lower() in ['yes', 'true'],
+            'scope_alignment': data.get('scope_alignment', 'maybe').lower() in ['yes', 'true'],
             'overall_feasibility': data.get('overall_feasibility'),
             'customer_status': data.get('customer_status'),
             'strategic_note': data.get('strategic_note'),
             'final_recommendation': data.get('final_recommendation'),
+            'contact_id_fk': contact_id_fk # The ID determined above
         }
-
-        # 4. Extract and prepare contact data fields
-        contact_data = data.get('contact', {})
-        contact_fields = {
-            'rfq_id_fk': rfq_id,
-            'contact_role': contact_data.get('role'),
-            'contact_email': contact_data.get('email'),
-            'contact_phone': contact_data.get('phone'),
-        }
-
-        # Construct and execute INSERT for 'main' table
+        
         main_columns = ', '.join(main_fields.keys())
-        # Use Psycopg2 named parameter substitution (%(key)s)
-        main_placeholders = ', '.join([f"%({key})s" for key in main_fields.keys()])
-        main_sql = f"INSERT INTO main ({main_columns}) VALUES ({main_placeholders})"
-        cursor.execute(main_sql, main_fields)
+        main_placeholders = ', '.join(['%s'] * len(main_fields))
+        main_values = list(main_fields.values())
 
-        # Construct and execute INSERT for 'contact' table
-        contact_columns = ', '.join(contact_fields.keys())
-        contact_placeholders = ', '.join([f"%({key})s" for key in contact_fields.keys()])
-        contact_sql = f"INSERT INTO contact ({contact_columns}) VALUES ({contact_placeholders})"
-        cursor.execute(contact_sql, contact_fields)
-
+        insert_main_sql = f"""
+        INSERT INTO main ({main_columns})
+        VALUES ({main_placeholders})
+        """
+        
+        # 3. Execute main insertion
+        cursor.execute(insert_main_sql, main_values)
+        
+        # 4. Commit the transaction if successful
         conn.commit()
+
         return jsonify({
             "status": "success", 
             "message": "RFQ data successfully stored.", 
             "rfq_id": rfq_id
         }), 201
 
-    except Psycopg2Error as e:
+    except ConnectionError as e:
+        # Handled in get_db for connection issues
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    except OperationalError as e:
         if conn:
             conn.rollback()
-        
-        # FIX: Safely access e.pgerror, falling back to str(e) if it's None.
-        pg_error = e.pgerror.strip() if e.pgerror else str(e)
-        
+            
+        # Safely extract PostgreSQL error details
+        pg_error_message = getattr(e, 'pgerror', None)
+        detail_message = pg_error_message.strip() if pg_error_message else str(e)
+
         return jsonify({
-            "status": "error", 
-            "message": f"Database insertion failed (PostgreSQL Error): {pg_error}",
-            "rfq_id": rfq_id
+            "status": "error",
+            "message": f"Database insertion failed (PostgreSQL Error): {detail_message}",
+            "rfq_id": rfq_id if rfq_id else None
         }), 500
+
     except Exception as e:
+        if conn:
+            conn.rollback()
+            
         return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
+        
     finally:
         if cursor:
             cursor.close()
         if conn:
             conn.close()
-
-
-# --- API Endpoint: Get Data ---
-
-@app.route('/api/rfq/get/<rfq_id>', methods=['GET'])
-def get_rfq_data(rfq_id):
-    """Retrieves and joins data from both tables for a specific RFQ ID using PostgreSQL."""
-    conn = None
-    cursor = None
-    try:
-        conn, cursor = get_db()
-        
-        query = """
-        SELECT 
-            m.*, 
-            c.contact_role, 
-            c.contact_email, 
-            c.contact_phone
-        FROM 
-            main m
-        LEFT JOIN 
-            contact c ON m.rfq_id = c.rfq_id_fk
-        WHERE 
-            m.rfq_id = %s
-        """
-        # Execute query using tuple for positional substitution (%s)
-        cursor.execute(query, (rfq_id,))
-        row = cursor.fetchone()
-
-        if row is None:
-            return jsonify({"status": "error", "message": f"RFQ with ID {rfq_id} not found."}), 404
-        
-        # Psycopg2 with RealDictCursor returns a dictionary, which is perfect for JSON
-        data = dict(row)
-        
-        # Restructure contact information into a nested object
-        contact_info = {
-            "role": data.pop('contact_role'),
-            "email": data.pop('contact_email'),
-            "phone": data.pop('contact_phone'),
-        }
-        
-        # PostgreSQL BOOLEAN types (True/False) are preserved. Convert them to string 'Yes'/'No' for API response clarity
-        data['technical_capacity'] = 'Yes' if data['technical_capacity'] else 'No'
-        data['scope_alignment'] = 'Yes' if data['scope_alignment'] else 'No'
-
-        data['contact'] = contact_info
-
-        return jsonify({"status": "success", "data": data}), 200
-
-    except Psycopg2Error as e:
-        # FIX: Safely access e.pgerror, falling back to str(e) if it's None.
-        pg_error = e.pgerror.strip() if e.pgerror else str(e)
-        return jsonify({"status": "error", "message": f"Database query failed (PostgreSQL Error): {pg_error}"}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
-
 
 if __name__ == '__main__':
-    # Ensure you replace the dummy credentials in DB_CONFIG before running.
-    # The application will only start successfully if it can connect to the database.
-    app.run(debug=True, port=5000)
+    # When running locally, set the FLASK_APP environment variable.
+    # On Azure, gunicorn will handle execution.
+    app.run(debug=True)
