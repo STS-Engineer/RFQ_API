@@ -40,6 +40,16 @@ def get_db():
         raise e
 
 
+def convert_to_boolean(value):
+    """Safely converts string/bool input to a Python boolean."""
+    if isinstance(value, bool):
+        return value # Handles true/false from JSON
+    if isinstance(value, str):
+        # Handles "yes"/"true" strings
+        return value.lower() in ['yes', 'true']
+    # Default behavior for missing/unexpected values (e.g., None, 'maybe')
+    return False 
+
 # --- 3. API ENDPOINTS ---
 
 @app.route('/api/rfq/submit', methods=['POST'])
@@ -130,8 +140,8 @@ def submit_rfq_data():
             'validation_responsibility': data.get('validation_responsibility'),
             'design_ownership': data.get('design_ownership'),
             'development_costs': data.get('development_costs'),
-            'technical_capacity': data.get('technical_capacity', 'maybe').lower() in ['yes', 'true'],
-            'scope_alignment': data.get('scope_alignment', 'maybe').lower() in ['yes', 'true'],
+            'technical_capacity': convert_to_boolean(data.get('technical_capacity', 'maybe')),
+            'scope_alignment': convert_to_boolean(data.get('scope_alignment', 'maybe')),
             'overall_feasibility': data.get('overall_feasibility'),
             'customer_status': data.get('customer_status'),
             'strategic_note': data.get('strategic_note'),
