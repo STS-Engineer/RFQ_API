@@ -323,6 +323,126 @@ def get_rfq_data():
             conn.close()
 
 
+
+
+@app.route('/api/products', methods=['GET'])
+def retrieve_products():
+    """
+    Retrieves product data from the 'products' table, filtering by product_name.
+    """
+    product_name = request.args.get('productName')
+
+    # 1. Parameter Validation (Required: productName)
+    if not product_name:
+        return jsonify({
+            "error": "Missing required query parameter: productName",
+            "details": "The 'productName' parameter must be provided to search the products table."
+        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
+
+    conn = None
+    try:
+        conn, cursor = get_db()
+        
+        # 2. SQL Query: Case-insensitive partial match on product_name
+        query = """
+            SELECT *
+            FROM public.products
+            WHERE product_name ILIKE %s;
+        """
+        # Add wildcards for ILIKE search pattern
+        search_pattern = f"%{product_name}%"
+        cursor.execute(query, (search_pattern,))
+
+        products_data = cursor.fetchall()
+
+        # 3. Format and Send Response (200 OK)
+        return jsonify({
+            "query": product_name,
+            "products": products_data, # List of dicts (RealDictCursor handles this)
+            "source": "Postgresql"     # Emulate the original schema's source
+        }), 200
+
+    except ConnectionError as e:
+        # Handled by get_db()
+        return jsonify({"error": str(e), "details": "Check database connection parameters."}), 500
+
+    except OperationalError as e:
+        # Database query failure (e.g., table not found, bad query)
+        pg_error_message = getattr(e, 'pgerror', str(e))
+        return jsonify({
+            "error": "Error retrieving products from the database",
+            "details": pg_error_message
+        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
+        
+    except Exception as e:
+        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        
+    finally:
+        if conn:
+            conn.close()
+
+# ----------------------------------------------------------------------
+
+@app.route('/api/product-lines', methods=['GET'])
+def retrieve_product_line():
+    """
+    Retrieves product line data from the 'product_lines' table, filtering by the 'name' column.
+    """
+    # The original schema uses 'productName' for this query too
+    product_line_query = request.args.get('productName') 
+
+    # 1. Parameter Validation (Required: productName)
+    if not product_line_query:
+        return jsonify({
+            "error": "Missing required query parameter: productName",
+            "details": "The 'productName' parameter must be provided to search the product-line table."
+        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
+
+    conn = None
+    try:
+        conn, cursor = get_db()
+
+        # 2. SQL Query: Case-insensitive partial match on the 'name' column
+        query = """
+            SELECT *
+            FROM public.product_lines
+            WHERE name ILIKE %s;
+        """
+        search_pattern = f"%{product_line_query}%"
+        cursor.execute(query, (search_pattern,))
+
+        product_line_data = cursor.fetchall()
+
+        # 3. Format and Send Response (200 OK)
+        return jsonify({
+            "query": product_line_query,
+            "productLine": product_line_data, # List of dicts (RealDictCursor handles this)
+            "source": "Postgresql"
+        }), 200
+
+    except ConnectionError as e:
+        # Handled by get_db()
+        return jsonify({"error": str(e), "details": "Check database connection parameters."}), 500
+
+    except OperationalError as e:
+        # Database query failure
+        pg_error_message = getattr(e, 'pgerror', str(e))
+        return jsonify({
+            "error": "Error retrieving product-line items from the database",
+            "details": pg_error_message
+        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
+
+    except Exception as e:
+        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        
+    finally:
+        if conn:
+            conn.close()
+
+
+
+
+
 if __name__ == '__main__':
     # When running locally, set the FLASK_APP environment variable.
     # On Azure, gunicorn will handle execution.
