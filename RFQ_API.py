@@ -1,4 +1,5 @@
 import os
+import base64
 import psycopg2
 from psycopg2 import OperationalError, errorcodes, extras
 from flask import Flask, request, jsonify
@@ -323,59 +324,60 @@ def get_rfq_data():
             conn.close()
 
 
-
-
 @app.route('/api/products', methods=['GET'])
-def retrieve_products():
+def retrieve_products_modified():
     """
-    Retrieves product data from the 'products' table, filtering by product_name.
+    Retrieves product data from the 'products' table, excluding the large 'product_pictures' column.
     """
     product_name = request.args.get('productName')
-
-    # 1. Parameter Validation (Required: productName)
-    if not product_name:
-        return jsonify({
-            "error": "Missing required query parameter: productName",
-            "details": "The 'productName' parameter must be provided to search the products table."
-        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
 
     conn = None
     try:
         conn, cursor = get_db()
         
-        # 2. SQL Query: Case-insensitive partial match on product_name
-        query = """
-            SELECT *
-            FROM public.products
-            WHERE product_name ILIKE %s;
+        # --- NEW EXPLICIT SELECT QUERY ---
+        select_columns = """
+            id, product_name, product_line, description, product_definition, 
+            operating_environment, technical_parameters, machines_and_tooling, 
+            manufacturing_strategy, purchasing_strategy, prototypes_ppap_and_sop, 
+            engineering_and_testing, capacity, our_advantages, gmdc_pct, 
+            product_line_id, customers_in_production, customer_in_development, 
+            level_of_interest_and_why, estimated_price_per_product, 
+            prod_if_customer_in_china, costing_data, created_at
         """
-        # Add wildcards for ILIKE search pattern
-        search_pattern = f"%{product_name}%"
-        cursor.execute(query, (search_pattern,))
+        
+        query = f"SELECT {select_columns} FROM public.products"
+        search_pattern = None
+        
+        if product_name:
+            # Filter by partial name match
+            query += " WHERE product_name ILIKE %s"
+            search_pattern = f"%{product_name}%"
+            cursor.execute(query, (search_pattern,))
+        else:
+            # Get all products
+            cursor.execute(query) 
 
         products_data = cursor.fetchall()
+        
+        # No need for base64 conversion here! 🎉
 
-        # 3. Format and Send Response (200 OK)
+        # 2. Format and Send Response (200 OK)
         return jsonify({
-            "query": product_name,
-            "products": products_data, # List of dicts (RealDictCursor handles this)
-            "source": "Postgresql"     # Emulate the original schema's source
+            "query": product_name if product_name else "All Products",
+            "products": products_data, 
+            "source": "database"     
         }), 200
 
     except ConnectionError as e:
-        # Handled by get_db()
-        return jsonify({"error": str(e), "details": "Check database connection parameters."}), 500
+        return jsonify({"error": str(e), "details": "Database connection failed."}), 500
 
     except OperationalError as e:
-        # Database query failure (e.g., table not found, bad query)
         pg_error_message = getattr(e, 'pgerror', str(e))
         return jsonify({
             "error": "Error retrieving products from the database",
             "details": pg_error_message
-        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
-        
-    except Exception as e:
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+        }), 400
         
     finally:
         if conn:
@@ -384,61 +386,55 @@ def retrieve_products():
 # ----------------------------------------------------------------------
 
 @app.route('/api/product-lines', methods=['GET'])
-def retrieve_product_line():
+def retrieve_product_line_modified():
     """
-    Retrieves product line data from the 'product_lines' table, filtering by the 'name' column.
+    Retrieves product line data from the 'product_lines' table using a required ID.
+    (Used to identify {Product_Line} automatically after product selection in Step 1)
     """
-    # The original schema uses 'productName' for this query too
-    product_line_query = request.args.get('productName') 
+    # Changed parameter name to reflect the required foreign key
+    product_line_id = request.args.get('productLineId') 
 
-    # 1. Parameter Validation (Required: productName)
-    if not product_line_query:
+    # 1. Parameter Validation (Required: productLineId)
+    if not product_line_id:
         return jsonify({
-            "error": "Missing required query parameter: productName",
-            "details": "The 'productName' parameter must be provided to search the product-line table."
-        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
+            "error": "Missing required query parameter: productLineId",
+            "details": "The ID of the product line must be provided to retrieve its details."
+        }), 400 
 
     conn = None
     try:
         conn, cursor = get_db()
 
-        # 2. SQL Query: Case-insensitive partial match on the 'name' column
+        # 2. SQL Query: Exact match on the 'id' column
         query = """
             SELECT *
             FROM public.product_lines
-            WHERE name ILIKE %s;
+            WHERE id = %s;
         """
-        search_pattern = f"%{product_line_query}%"
-        cursor.execute(query, (search_pattern,))
+        cursor.execute(query, (product_line_id,))
 
         product_line_data = cursor.fetchall()
 
         # 3. Format and Send Response (200 OK)
         return jsonify({
-            "query": product_line_query,
-            "productLine": product_line_data, # List of dicts (RealDictCursor handles this)
-            "source": "Postgresql"
+            "query": product_line_id,
+            "productLine": product_line_data, 
+            "source": "database"
         }), 200
 
     except ConnectionError as e:
-        # Handled by get_db()
-        return jsonify({"error": str(e), "details": "Check database connection parameters."}), 500
+        return jsonify({"error": str(e), "details": "Database connection failed."}), 500
 
     except OperationalError as e:
-        # Database query failure
         pg_error_message = getattr(e, 'pgerror', str(e))
         return jsonify({
             "error": "Error retrieving product-line items from the database",
             "details": pg_error_message
-        }), 400 # Matches the 400 Bad Request defined in the OpenAPI schema
+        }), 400
 
-    except Exception as e:
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
-        
     finally:
         if conn:
             conn.close()
-
 
 
 
