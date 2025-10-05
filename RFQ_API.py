@@ -452,7 +452,7 @@ def list_product_lines():
         # 1. Requête SQL pour obtenir uniquement les ID et les noms (ou texte)
         # SQL query to get only the ID and Name (or text)
         query = """
-            SELECT id, name_text AS product_line_name, type_of_products_text AS description_snippet
+            SELECT id, name AS product_line_name, type_of_products AS description_snippet
             FROM public.product_lines
             ORDER BY id;
         """
