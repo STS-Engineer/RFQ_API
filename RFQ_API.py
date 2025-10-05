@@ -437,7 +437,50 @@ def retrieve_product_line_modified():
             conn.close()
 
 
+@app.route('/api/product-lines/list', methods=['GET'])
+def list_product_lines():
+    """
+    Retrieves the list of all product lines (ID and Name) for selection menus.
+    This API does NOT require any parameters.
+    """
+    conn = None
+    try:
+        # Assurez-vous d'avoir une fonction get_db() qui retourne la connexion et le curseur
+        # Make sure you have a working get_db() function returning connection and cursor
+        conn, cursor = get_db()
 
+        # 1. Requête SQL pour obtenir uniquement les ID et les noms (ou texte)
+        # SQL query to get only the ID and Name (or text)
+        query = """
+            SELECT id, name_text AS product_line_name, type_of_products_text AS description_snippet
+            FROM public.product_lines
+            ORDER BY id;
+        """
+        cursor.execute(query)
+
+        product_lines_list = cursor.fetchall()
+
+        # 2. Format et Envoi de la Réponse (200 OK)
+        # Format and Send Response (200 OK)
+        return jsonify({
+            "productLinesList": product_lines_list,
+            "count": len(product_lines_list),
+            "source": "database"
+        }), 200
+
+    except ConnectionError as e:
+        return jsonify({"error": str(e), "details": "Database connection failed."}), 500
+
+    except OperationalError as e:
+        pg_error_message = getattr(e, 'pgerror', str(e))
+        return jsonify({
+            "error": "Error retrieving product lines list from the database",
+            "details": pg_error_message
+        }), 400
+
+    finally:
+        if conn:
+            conn.close()
 
 if __name__ == '__main__':
     # When running locally, set the FLASK_APP environment variable.
