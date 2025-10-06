@@ -482,7 +482,72 @@ def list_product_lines():
         if conn:
             conn.close()
 
+@app.route('/api/product-lines/details', methods=['GET'])
+def get_product_line_by_product_name():
+    """
+    Retrieves product line details based on a given product name.
+    Useful when the client app only knows the product name and 
+    needs to find the related product line info.
+    """
+    product_name = request.args.get('productName')
 
+    # 1. Validate parameter
+    if not product_name:
+        return jsonify({
+            "error": "Missing required query parameter: productName",
+            "details": "Provide a valid product name to retrieve product-line details."
+        }), 400
+
+    conn = None
+    try:
+        conn, cursor = get_db()
+
+        # 2. Query to join products and product_lines tables
+        query = """
+            SELECT 
+                pl.id AS product_line_id,
+                pl.name AS product_line_name,
+                pl.type_of_products,
+                pl.description,
+                pl.market_segment,
+                p.id AS product_id,
+                p.product_name,
+                p.description AS product_description
+            FROM public.products p
+            INNER JOIN public.product_lines pl 
+                ON p.product_line_id = pl.id
+            WHERE p.product_name ILIKE %s;
+        """
+
+        cursor.execute(query, (f"%{product_name}%",))
+        results = cursor.fetchall()
+
+        if not results:
+            return jsonify({
+                "status": "success",
+                "message": "No product line found matching the provided product name.",
+                "data": []
+            }), 200
+
+        return jsonify({
+            "status": "success",
+            "message": f"Retrieved {len(results)} product-line record(s) for '{product_name}'.",
+            "data": results
+        }), 200
+
+    except ConnectionError as e:
+        return jsonify({"error": str(e), "details": "Database connection failed."}), 500
+
+    except OperationalError as e:
+        pg_error_message = getattr(e, 'pgerror', str(e))
+        return jsonify({
+            "error": "Error retrieving product-line details from the database",
+            "details": pg_error_message
+        }), 400
+
+    finally:
+        if conn:
+            conn.close()
 if __name__ == '__main__':
     # When running locally, set the FLASK_APP environment variable.
     # On Azure, gunicorn will handle execution.
