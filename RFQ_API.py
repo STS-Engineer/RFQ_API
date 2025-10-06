@@ -481,6 +481,110 @@ def list_product_lines():
     finally:
         if conn:
             conn.close()
+@app.route('/api/products/with-details', methods=['GET'])
+def get_products_with_details():
+    """
+    Retrieves products with joined product line details in a single query.
+    Perfect for product selection and detailed information display.
+    """
+    product_name = request.args.get('name')  # Optional: filter by exact name
+    product_line_id = request.args.get('product_line_id')  # Optional: filter by product line
+
+    conn = None
+    try:
+        conn, cursor = get_db()
+        
+        # JOIN query to get product + product line details
+        query = """
+            SELECT 
+                p.id,
+                p.product_name,
+                p.description,
+                p.product_definition,
+                p.operating_environment,
+                p.technical_parameters,
+                p.machines_and_tooling,
+                p.manufacturing_strategy,
+                p.purchasing_strategy,
+                p.prototypes_ppap_and_sop,
+                p.engineering_and_testing,
+                p.capacity,
+                p.our_advantages,
+                p.gmdc_pct,
+                p.product_line_id,
+                p.customers_in_production,
+                p.customer_in_development,
+                p.level_of_interest_and_why,
+                p.estimated_price_per_product,
+                p.prod_if_customer_in_china,
+                p.costing_data,
+                p.created_at,
+                
+                -- Product Line Details
+                pl.id as product_line_id,
+                pl.name as product_line_name,
+                pl.type_of_products,
+                pl.material_composition,
+                pl.technical_advantages,
+                pl.key_characteristics,
+                pl.target_applications,
+                pl.unique_singularities,
+                pl.additional_applications,
+                pl.manufacturing_process,
+                pl.quality_standards,
+                pl.industry_standards,
+                pl.environmental_compliance,
+                pl.operating_temperature_range,
+                pl.pressure_rating,
+                pl.chemical_resistance,
+                pl.wear_resistance,
+                pl.thermal_conductivity,
+                pl.electrical_conductivity,
+                pl.estimated_price_range,
+                pl.lead_time,
+                pl.minimum_order_quantity,
+                pl.created_at as product_line_created_at
+            FROM 
+                public.products p
+            LEFT JOIN 
+                public.product_lines pl ON p.product_line_id = pl.id
+            WHERE 1=1
+        """
+        
+        params = []
+        
+        # Add filters if provided
+        if product_name:
+            query += " AND p.product_name = %s"
+            params.append(product_name)
+            
+        if product_line_id:
+            query += " AND p.product_line_id = %s"
+            params.append(product_line_id)
+        
+        query += " ORDER BY p.product_name"
+        
+        cursor.execute(query, tuple(params))
+        products_with_details = cursor.fetchall()
+
+        return jsonify({
+            "status": "success",
+            "message": f"Retrieved {len(products_with_details)} product(s) with details",
+            "data": products_with_details
+        }), 200
+
+    except ConnectionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    except OperationalError as e:
+        return jsonify({
+            "status": "error", 
+            "message": f"Database query failed: {str(e)}"
+        }), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Unexpected error: {e}"}), 500
+    finally:
+        if conn:
+            conn.close()
 
 if __name__ == '__main__':
     # When running locally, set the FLASK_APP environment variable.
