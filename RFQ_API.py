@@ -520,30 +520,10 @@ def get_products_with_details():
                 p.costing_data,
                 p.created_at,
                 
-                -- Product Line Details
+                -- Product Line Details (only existing columns)
                 pl.id as product_line_id,
                 pl.name as product_line_name,
-                pl.type_of_products,
-                pl.material_composition,
-                pl.technical_advantages,
-                pl.key_characteristics,
-                pl.target_applications,
-                pl.unique_singularities,
-                pl.additional_applications,
-                pl.manufacturing_process,
-                pl.quality_standards,
-                pl.industry_standards,
-                pl.environmental_compliance,
-                pl.operating_temperature_range,
-                pl.pressure_rating,
-                pl.chemical_resistance,
-                pl.wear_resistance,
-                pl.thermal_conductivity,
-                pl.electrical_conductivity,
-                pl.estimated_price_range,
-                pl.lead_time,
-                pl.minimum_order_quantity,
-                pl.created_at as product_line_created_at
+                pl.type_of_products
             FROM 
                 public.products p
             LEFT JOIN 
