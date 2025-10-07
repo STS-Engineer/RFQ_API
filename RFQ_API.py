@@ -7,14 +7,10 @@ import psycopg2
 import uuid
 import datetime
 import sys
-import threading
+import requests
 from psycopg2 import OperationalError, errorcodes, extras
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
-<<<<<<< HEAD
-
-=======
->>>>>>> 3d34e89 (API Update)
 
 # --- 1. CONFIGURATION ---
 # IMPORTANT: Replace these placeholders with your actual PostgreSQL credentials.
