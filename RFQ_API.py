@@ -4,13 +4,11 @@ import datetime
 import sys
 import base64
 import psycopg2
-import uuid
-import datetime
-import sys
 import requests
 from psycopg2 import OperationalError, errorcodes, extras
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
+
 
 # --- 1. CONFIGURATION ---
 # IMPORTANT: Replace these placeholders with your actual PostgreSQL credentials.
@@ -224,8 +222,6 @@ def submit_rfq_data():
 
 
 
-
-
 @app.route('/api/rfq/get', methods=['GET'])
 def get_rfq_data():
     """Retrieves RFQ data based on dynamic query parameters (rfq_id, customer_name, product_line)."""
@@ -406,15 +402,18 @@ def retrieve_products_modified():
             conn.close()
 
 
+
+
+
 #---------------------------------------------------------------------------------------------------------------
 
 # --- APPLICATION CONFIGURATION ---
 # IMPORTANT: When deploying to Azure, change this to your deployed URL (e.g., https://rfq-api.azurewebsites.net)
-BASE_URL = "https://rfq-api.azurewebsites.net"
+BASE_URL = "http://127.0.0.1:5000"
 
 # --- External RFQ Submission API ---
 # This is the target endpoint for the final validated RFQ data
-RFQ_SUBMISSION_API_URL = "https://rfq-api.azurewebsites.net/api/rfq/submit"
+RFQ_SUBMISSION_API_URL = "http://127.0.0.1:5000/api/rfq/submit"
 
 # --- Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED RELAY) ---
 # NOTE: This configuration relies on your internal mail protection service allowing
@@ -787,6 +786,12 @@ def handle_validation():
     </body>
     </html>
     """
+
+
+
+
+
+
 
 
 # ----------------------------------------------------------------------
