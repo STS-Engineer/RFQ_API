@@ -379,20 +379,24 @@ def submit_rfq_data():
         return jsonify({"status": "error", "message": "Missing required field: rfq_id"}), 400
 
     # --- 1. Extract and Normalize Validation Data ---
-    # The payload sends status as ['CONFIRMED'] (array), but the DB column is a single string.
-    final_status_array = data.pop('status', None) 
+    # Status is now a simple string, validator_comments is text.
+    final_status = data.pop('status', None) 
     final_validator_comments = data.pop('validator_comments', None)
 
-    # Normalize status from list to string (e.g., ['CONFIRMED'] -> 'CONFIRMED')
-    if isinstance(final_status_array, list) and final_status_array:
-        final_status = final_status_array[0]
-    else:
-        final_status = None # Or retrieve data.get('decision') if applicable, but better to keep it clean.
-
+    # Normalize status from list to string if it somehow arrives as an array
+    if isinstance(final_status, list) and final_status:
+        final_status = final_status[0]
+    
+    # Helper to handle missing/empty string numerical inputs gracefully
+    def get_numeric(key):
+        val = data.get(key)
+        # Convert empty strings to None, otherwise psycopg2 may crash attempting to cast "" to numeric
+        return val if val != '' else None
+    
     try:
         conn, cursor = get_db()
         
-        # --- CONTACT HANDLING (Logic Unchanged) ---
+        # --- CONTACT HANDLING: Find or Create Contact to get FK ---
         contact_data = data.get('contact', {})
         contact_email = contact_data.get('email')
         
@@ -411,9 +415,12 @@ def submit_rfq_data():
             cursor.execute(insert_contact_sql, (contact_data.get('role'), contact_data.get('email'), contact_data.get('phone')))
             contact_id_fk = cursor.fetchone()['contact_id']
 
-        # --- 2. MAIN RFQ INSERTION (Using Explicit Columns) ---
+        # NOTE: Skip the 'contact' object in the payload as we have the FK.
+        data.pop('contact', None) 
+        
+        # --- 2. MAIN RFQ INSERTION (FIXED ALIGNMENT) ---
 
-        # Define the exact order of columns for INSERT, ensuring all required fields are present
+        # Explicitly list all 36 columns (34 original + contact_id_fk + validator_comments + status)
         COLUMN_NAMES = [
             'rfq_id', 'customer_name', 'application', 'product_line', 'customer_pn', 'revision_level',
             'delivery_zone', 'delivery_plant', 'sop_year', 'annual_volume', 'rfq_reception_date',
@@ -422,19 +429,33 @@ def submit_rfq_data():
             'risks', 'decision', 'design_responsibility', 'validation_responsibility', 'design_ownership',
             'development_costs', 'technical_capacity', 'scope_alignment', 'overall_feasibility',
             'customer_status', 'strategic_note', 'final_recommendation', 'contact_id_fk', 
-            'validator_comments', 'status' # IMPORTANT: status is last due to its type change
+            'validator_comments', 'status' # New Validation Columns
         ]
         
-        # Build the list of values in the corresponding order
+        # Build the list of values (34 + FK + 2 Validation)
         main_values = [
+            # 1-6. VARCHAR fields
             data.get('rfq_id'), data.get('customer_name'), data.get('application'), data.get('product_line'), data.get('customer_pn'), data.get('revision_level'),
-            data.get('delivery_zone'), data.get('delivery_plant'), data.get('sop_year'), data.get('annual_volume'), data.get('rfq_reception_date'),
-            data.get('quotation_expected_date'), data.get('target_price_eur'), data.get('delivery_conditions'), data.get('payment_terms'),
-            data.get('business_trigger'), data.get('entry_barriers'), data.get('product_feasibility_note'), data.get('manufacturing_location'),
-            data.get('risks'), data.get('decision'), data.get('design_responsibility'), data.get('validation_responsibility'), data.get('design_ownership'),
-            data.get('development_costs'), convert_to_boolean(data.get('technical_capacity')), convert_to_boolean(data.get('scope_alignment')), data.get('overall_feasibility'),
-            data.get('customer_status'), data.get('strategic_note'), data.get('final_recommendation'), contact_id_fk, 
-            final_validator_comments, final_status # Insert normalized validator data
+            # 7-8. VARCHAR fields
+            data.get('delivery_zone'), data.get('delivery_plant'), 
+            # 9-10. INTEGER fields (Use get_numeric)
+            get_numeric('sop_year'), get_numeric('annual_volume'), 
+            # 11-12. DATE fields
+            data.get('rfq_reception_date'), data.get('quotation_expected_date'), 
+            # 13. NUMERIC field (Use get_numeric)
+            get_numeric('target_price_eur'), 
+            # 14-25. VARCHAR/TEXT fields
+            data.get('delivery_conditions'), data.get('payment_terms'), data.get('business_trigger'), data.get('entry_barriers'), data.get('product_feasibility_note'), 
+            data.get('manufacturing_location'), data.get('risks'), data.get('decision'), data.get('design_responsibility'), data.get('validation_responsibility'), 
+            data.get('design_ownership'), data.get('development_costs'), 
+            # 26-27. BOOLEAN fields (Use convert_to_boolean)
+            convert_to_boolean(data.get('technical_capacity')), convert_to_boolean(data.get('scope_alignment')), 
+            # 28-31. VARCHAR/TEXT fields
+            data.get('overall_feasibility'), data.get('customer_status'), data.get('strategic_note'), data.get('final_recommendation'), 
+            # 32. FOREIGN KEY (INTEGER)
+            contact_id_fk, 
+            # 33-34. VALIDATOR FIELDS (TEXT/VARCHAR)
+            final_validator_comments, final_status 
         ]
         
         columns_sql = ', '.join(COLUMN_NAMES)
@@ -442,7 +463,6 @@ def submit_rfq_data():
 
         insert_main_sql = f"INSERT INTO main ({columns_sql}) VALUES ({placeholders_sql})"
         
-        # 3. Execute main insertion
         cursor.execute(insert_main_sql, main_values)
         conn.commit()
 
@@ -463,7 +483,6 @@ def submit_rfq_data():
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
-
 
 
 @app.route('/api/rfq/get', methods=['GET'])
