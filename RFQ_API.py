@@ -2,16 +2,17 @@ import os
 import uuid
 import datetime
 import sys
-import base64
-import psycopg2
+import json 
 import requests
+import psycopg2
 from psycopg2 import OperationalError, errorcodes, extras
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
 
 
-# --- 1. CONFIGURATION ---
-# IMPORTANT: Replace these placeholders with your actual PostgreSQL credentials.
+# --- APPLICATION CONFIGURATION (HARDCODED FOR DEPLOYMENT/TESTING) ---
+
+# PostgreSQL Configuration
 DB_CONFIG = {
     "host": "avo-adb-002.postgres.database.azure.com",
     "database": "RFQ_DATA",
@@ -19,422 +20,113 @@ DB_CONFIG = {
     "password": "St$@0987"
 }
 
+# Flask Application Initialization
 app = Flask(__name__)
 
-# --- 2. DATABASE CONNECTION UTILITY ---
+# URL Configuration
+# When deploying to Azure, this BASE_URL should be changed to your public domain
+BASE_URL = "https://rfq-api.azurewebsites.net/" 
+RFQ_SUBMISSION_API_URL = "https://rfq-api.azurewebsites.net/api/rfq/submit" 
+# NOTE: The public API URL is hardcoded to Azure as requested.
+
+# Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED RELAY)
+app.config['MAIL_SERVER'] = 'avocarbon-com.mail.protection.outlook.com'
+app.config['MAIL_PORT'] = 25
+app.config['MAIL_USE_TLS'] = False 
+app.config['MAIL_DEFAULT_SENDER'] = 'administration.STS@avocarbon.com'
+
+mail = Mail(app)
+
+
+# --- DATABASE CONNECTION UTILITY ---
 
 def get_db():
     """Returns a PostgreSQL database connection and a RealDictCursor."""
     conn = None
     try:
-        # Establish connection using the configuration dictionary
         conn = psycopg2.connect(**DB_CONFIG)
-        # Set the row factory to return dictionaries
         cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
         return conn, cursor
     except OperationalError as e:
-        # Log the specific connection failure
         print(f"PostgreSQL connection failed: {e}")
-        # Re-raise the error to be handled by the API endpoint caller
-        if conn:
-            conn.close()
-        # Use str(e) as a fallback if e.pgerror is not available (common in connection errors)
+        if conn: conn.close()
         error_message = f"Database connection failed: {str(e)}"
         raise ConnectionError(error_message)
     except Exception as e:
-        if conn:
-            conn.close()
+        if conn: conn.close()
         raise e
 
 
 def convert_to_boolean(value):
     """Safely converts string/bool input to a Python boolean."""
     if isinstance(value, bool):
-        return value # Handles true/false from JSON
+        return value
     if isinstance(value, str):
-        # Handles "yes"/"true" strings
         return value.lower() in ['yes', 'true']
-    # Default behavior for missing/unexpected values (e.g., None, 'maybe')
     return False 
 
-# --- 3. API ENDPOINTS ---
 
-@app.route('/api/rfq/submit', methods=['POST'])
-def submit_rfq_data():
-    """
-    Receives structured RFQ data, including top-level validation status and comments, 
-    and inserts it into the main and contact tables.
-    """
-    data = request.get_json()
+# --- PERSISTENT STATE MANAGEMENT FUNCTIONS (PostgreSQL) ---
+
+def get_request_data(request_id):
+    """Retrieves pending request data from the database."""
     conn = None
-    rfq_id = None
-    
-    if not data:
-        return jsonify({"status": "error", "message": "No data provided"}), 400
-
-    rfq_id = data.get('rfq_id')
-    if not rfq_id:
-        return jsonify({"status": "error", "message": "Missing required field: rfq_id"}), 400
-
-    # --- NEW: Extract Validation Data from the top level ---
-    # We use .pop() to remove these from the main dictionary.
-    # We expect these fields when the Flask validation handler calls this API.
-    final_status = data.pop('status', None) 
-    final_validator_comments = data.pop('validator_comments', None)
-
     try:
-        # 1. Establish connection
+        conn, cursor = get_db()
+        # Only look for PENDING requests
+        cursor.execute("SELECT data FROM pending_validations WHERE request_id = %s AND status = 'PENDING';", (request_id,))
+        result = cursor.fetchone()
+        
+        if result and 'data' in result:
+            return result['data']
+        return None
+    except ConnectionError:
+        return None 
+    except Exception as e:
+        sys.stderr.write(f"DB GET FAILED: {e}\n")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def set_request_data(request_id, data):
+    """Stores or updates data into the pending_validations table."""
+    conn = None
+    try:
         conn, cursor = get_db()
         
-        # --- CONTACT HANDLING (1:N Relationship - Logic unchanged) ---
-        contact_data = data.get('contact', {})
-        contact_email = contact_data.get('email')
-        
-        if not contact_email:
-            conn.close()
-            return jsonify({"status": "error", "message": "Missing required contact field: email"}), 400
-
-        contact_id_fk = None
-
-        # A. Try to find existing contact by email
-        cursor.execute(
-            "SELECT contact_id FROM contact WHERE contact_email = %s", 
-            (contact_email,)
-        )
-        existing_contact = cursor.fetchone()
-
-        if existing_contact:
-            # Contact found, use existing ID
-            contact_id_fk = existing_contact['contact_id']
-        else:
-            # B. Contact not found, insert new contact and retrieve its new ID
-            insert_contact_sql = """
-            INSERT INTO contact (contact_role, contact_email, contact_phone)
+        insert_sql = """
+            INSERT INTO pending_validations (request_id, data, status)
             VALUES (%s, %s, %s)
-            RETURNING contact_id;
-            """
-            cursor.execute(
-                insert_contact_sql,
-                (
-                    contact_data.get('role'),
-                    contact_data.get('email'),
-                    contact_data.get('phone')
-                )
-            )
-            # Fetch the ID generated by SERIAL
-            contact_id_fk = cursor.fetchone()['contact_id']
-
-        # --- MAIN RFQ INSERTION ---
-
-        # 2. Prepare main data fields
-        main_fields = {
-            'rfq_id': rfq_id,
-            'customer_name': data.get('customer_name'),
-            'application': data.get('application'),
-            'product_line': data.get('product_line'),
-            'customer_pn': data.get('customer_pn'),
-            'revision_level': data.get('revision_level'),
-            'delivery_zone': data.get('delivery_zone'),
-            'delivery_plant': data.get('delivery_plant'),
-            'sop_year': data.get('sop_year'),
-            'annual_volume': data.get('annual_volume'),
-            'rfq_reception_date': data.get('rfq_reception_date'),
-            'quotation_expected_date': data.get('quotation_expected_date'),
-            'target_price_eur': data.get('target_price_eur'),
-            'delivery_conditions': data.get('delivery_conditions'),
-            'payment_terms': data.get('payment_terms'),
-            'business_trigger': data.get('business_trigger'),
-            'entry_barriers': data.get('entry_barriers'),
-            'product_feasibility_note': data.get('product_feasibility_note'),
-            'manufacturing_location': data.get('manufacturing_location'),
-            'risks': data.get('risks'),
-            
-            # AI FIELDS (Retained)
-            'decision': data.get('decision'), 
-            'strategic_note': data.get('strategic_note'),
-            
-            'design_responsibility': data.get('design_responsibility'),
-            'validation_responsibility': data.get('validation_responsibility'),
-            'design_ownership': data.get('design_ownership'),
-            'development_costs': data.get('development_costs'),
-            'technical_capacity': convert_to_boolean(data.get('technical_capacity', 'maybe')),
-            'scope_alignment': convert_to_boolean(data.get('scope_alignment', 'maybe')),
-            'overall_feasibility': data.get('overall_feasibility'),
-            'customer_status': data.get('customer_status'),
-            'final_recommendation': data.get('final_recommendation'),
-            
-            # VALIDATOR FIELDS (New Columns)
-            'status': final_status, # Maps to the new 'status' column
-            'validator_comments': final_validator_comments, # Maps to the new 'validator_comments' column
-            
-            'contact_id_fk': contact_id_fk # The ID determined above
-        }
-        
-        main_columns = ', '.join(main_fields.keys())
-        main_placeholders = ', '.join(['%s'] * len(main_fields))
-        main_values = list(main_fields.values())
-
-        insert_main_sql = f"""
-        INSERT INTO main ({main_columns})
-        VALUES ({main_placeholders})
+            ON CONFLICT (request_id) DO UPDATE
+            SET data = EXCLUDED.data, status = EXCLUDED.status, created_at = NOW();
         """
-        
-        # 3. Execute main insertion
-        cursor.execute(insert_main_sql, main_values)
-        
-        # 4. Commit the transaction if successful
+        # Note: data is explicitly converted to JSON string for storage in JSONB column
+        cursor.execute(insert_sql, (request_id, json.dumps(data), data['status'])) 
         conn.commit()
-
-        return jsonify({
-            "status": "success", 
-            "message": "RFQ data successfully stored.", 
-            "rfq_id": rfq_id
-        }), 200
-
-    except ConnectionError as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    except OperationalError as e:
-        if conn:
-            conn.rollback()
-            
-        # Safely extract PostgreSQL error details
-        pg_error_message = getattr(e, 'pgerror', None)
-        detail_message = pg_error_message.strip() if pg_error_message else str(e)
-
-        return jsonify({
-            "status": "error",
-            "message": f"Database insertion failed (PostgreSQL Error): {detail_message}",
-            "rfq_id": rfq_id if rfq_id else None
-        }), 500
-
     except Exception as e:
-        if conn:
-            conn.rollback()
-            
-        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
-        
+        sys.stderr.write(f"DB SET FAILED: {e}\n")
+        if conn: conn.rollback()
     finally:
-        if cursor:
-            cursor.close()
         if conn:
             conn.close()
 
-
-
-@app.route('/api/rfq/get', methods=['GET'])
-def get_rfq_data():
-    """Retrieves RFQ data based on dynamic query parameters (rfq_id, customer_name, product_line)."""
-    
-    # Get all query parameters
-    rfq_id = request.args.get('rfq_id')
-    customer_name = request.args.get('customer_name')
-    product_line = request.args.get('product_line')
-    
-    # List to hold WHERE clause fragments and their corresponding values
-    where_clauses = []
-    query_params = []
-    
-    # --- 1. Dynamic WHERE Clause Construction ---
-    
-    if rfq_id:
-        # Use exact match for RFQ ID
-        where_clauses.append("m.rfq_id = %s")
-        query_params.append(rfq_id)
-
-    if customer_name:
-        # Use case-insensitive partial match for Customer Name
-        where_clauses.append("m.customer_name ILIKE %s")
-        query_params.append(f"%{customer_name}%") # Add wildcards for LIKE/ILIKE
-
-    if product_line:
-        # Use exact match for Product Line
-        where_clauses.append("m.product_line = %s")
-        query_params.append(product_line)
-
-    # Check if any filter was provided
-    if not where_clauses:
-        return jsonify({"status": "error", "message": "At least one search parameter (rfq_id, customer_name, or product_line) is required."}), 400
-
-    # Combine clauses with 'AND'
-    where_sql = " AND ".join(where_clauses)
-    
-    # --- 2. SQL Query Execution ---
-    
+def delete_request_data(request_id):
+    """Deletes request data (optional, but good for cleanup)."""
     conn = None
     try:
         conn, cursor = get_db()
-        
-        # SQL to join main and contact tables and filter results
-        # Alias 'm' for main and 'c' for contact
-        select_sql = f"""
-        SELECT 
-            m.*, 
-            c.contact_role, 
-            c.contact_email, 
-            c.contact_phone
-        FROM 
-            main m
-        INNER JOIN 
-            contact c ON m.contact_id_fk = c.contact_id
-        WHERE 
-            {where_sql}
-        ORDER BY 
-            m.rfq_reception_date DESC;
-        """
-        
-        cursor.execute(select_sql, tuple(query_params))
-        
-        results = cursor.fetchall()
-        
-        if not results:
-            return jsonify({
-                "status": "success",
-                "message": "No RFQ records found matching the criteria.",
-                "data": []
-            }), 200
-
-        # --- 3. Formatting Results (Optional, but recommended for clean API output) ---
-        
-        # Reformat the flat result rows into the original nested structure (main + nested contact)
-        formatted_results = []
-        for row in results:
-            # Create a dictionary for the main RFQ data
-            rfq_data = dict(row)
-            
-            # Extract contact fields and put them into a 'contact' dictionary
-            contact = {
-                'role': rfq_data.pop('contact_role', None),
-                'email': rfq_data.pop('contact_email', None),
-                'phone': rfq_data.pop('contact_phone', None)
-            }
-            # Remove the foreign key from the main object
-            rfq_data.pop('contact_id_fk', None) 
-            rfq_data.pop('contact_id', None) # Remove if joined table also returns its primary key
-            
-            # Add the nested contact object back
-            rfq_data['contact'] = contact
-            formatted_results.append(rfq_data)
-
-        return jsonify({
-            "status": "success", 
-            "message": f"Retrieved {len(formatted_results)} RFQ record(s).",
-            "data": formatted_results
-        }), 200
-
-    except ConnectionError as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-    except OperationalError as e:
-        # Log and rollback, though rollback isn't strictly necessary for a SELECT
-        print(f"PostgreSQL query failed: {e}")
-        return jsonify({
-            "status": "error",
-            "message": f"Database query failed: {str(e)}",
-            "query_params": request.args
-        }), 500
-
+        cursor.execute("DELETE FROM pending_validations WHERE request_id = %s;", (request_id,))
+        conn.commit()
     except Exception as e:
-        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
-        
+        sys.stderr.write(f"DB DELETE FAILED: {e}\n")
     finally:
         if conn:
             conn.close()
-
-
-@app.route('/api/products', methods=['GET'])
-def retrieve_products_modified():
-    """
-    Retrieves product data from the 'products' table, excluding the large 'product_pictures' column.
-    """
-    product_name = request.args.get('productName')
-
-    conn = None
-    try:
-        conn, cursor = get_db()
-        
-        # --- NEW EXPLICIT SELECT QUERY ---
-        select_columns = """
-            id, product_name, product_line, description, product_definition, 
-            operating_environment, technical_parameters, machines_and_tooling, 
-            manufacturing_strategy, purchasing_strategy, prototypes_ppap_and_sop, 
-            engineering_and_testing, capacity, our_advantages, gmdc_pct, 
-            product_line_id, customers_in_production, customer_in_development, 
-            level_of_interest_and_why, estimated_price_per_product, 
-            prod_if_customer_in_china, costing_data, created_at
-        """
-        
-        query = f"SELECT {select_columns} FROM public.products"
-        search_pattern = None
-        
-        if product_name:
-            # Filter by partial name match
-            query += " WHERE product_name ILIKE %s"
-            search_pattern = f"%{product_name}%"
-            cursor.execute(query, (search_pattern,))
-        else:
-            # Get all products
-            cursor.execute(query) 
-
-        products_data = cursor.fetchall()
-        
-        # No need for base64 conversion here! 🎉
-
-        # 2. Format and Send Response (200 OK)
-        return jsonify({
-            "query": product_name if product_name else "All Products",
-            "products": products_data, 
-            "source": "database"     
-        }), 200
-
-    except ConnectionError as e:
-        return jsonify({"error": str(e), "details": "Database connection failed."}), 500
-
-    except OperationalError as e:
-        pg_error_message = getattr(e, 'pgerror', str(e))
-        return jsonify({
-            "error": "Error retrieving products from the database",
-            "details": pg_error_message
-        }), 400
-        
-    finally:
-        if conn:
-            conn.close()
-
-
-
-
-
-#---------------------------------------------------------------------------------------------------------------
-
-# --- APPLICATION CONFIGURATION ---
-# IMPORTANT: When deploying to Azure, change this to your deployed URL (e.g., https://rfq-api.azurewebsites.net)
-BASE_URL = "https://rfq-api.azurewebsites.net"
-
-# --- External RFQ Submission API ---
-# This is the target endpoint for the final validated RFQ data
-RFQ_SUBMISSION_API_URL = "https://rfq-api.azurewebsites.net/api/rfq/submit"
-
-# --- Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED RELAY) ---
-# NOTE: This configuration relies on your internal mail protection service allowing
-# unauthenticated relaying from the server IP where this Flask app runs.
-app.config['MAIL_SERVER'] = 'avocarbon-com.mail.protection.outlook.com'
-app.config['MAIL_PORT'] = 25
-app.config['MAIL_USE_TLS'] = False  # Must be False for Port 25 unauthenticated relay
-app.config['MAIL_DEFAULT_SENDER'] = 'administration.STS@avocarbon.com'
-
-mail = Mail(app)
-
-# --- Simple Database (Mock Dictionary for State Management) ---
-# Stores the state of all validation requests, including the full RFQ payload
-validation_requests = {}
 
 # --- Helper Function for Synchronous Mail Sending (Non-Authenticated) ---
 def safe_send_mail(msg):
-    """
-    Synchronously sends email using Flask-Mail context.
-    Returns (ok: bool, err: Optional[str]).
-    """
+    """Synchronously sends email using Flask-Mail context."""
     try:
         print(f"DEBUG: Attempting SMTP connection to {app.config['MAIL_SERVER']}:{app.config['MAIL_PORT']} (TLS={app.config['MAIL_USE_TLS']}) - NO AUTHENTICATION")
         with app.app_context():
@@ -451,37 +143,31 @@ def safe_send_mail(msg):
 # ----------------------------------------------------------------------
 @app.route('/api/send-report', methods=['POST', 'PUT'])
 def send_report_for_validation():
-    # DEBUG LOG: Confirm method and payload
     print(f"DEBUG: Endpoint /api/send-report hit with method: {request.method}")
-
     data = request.json
 
     # 1. Get Data from Assistant
-    # 'report' is the narrative text for the validator's email body
-    # 'rfq_payload' is the full structured JSON data generated by the AI
     report_content = data.get('report')
     user_email = data.get('user_email')
     validator_email = data.get('validator_email')
     rfq_payload = data.get('rfq_payload')
 
-    # DEBUG LOG: Show received payload data
-    print(f"DEBUG: Received report data for validation: Validator={validator_email}, User={user_email}")
-
     if not all([report_content, user_email, validator_email, rfq_payload]):
         print("DEBUG: Missing required data.")
         return jsonify({"message": "Missing required data (report, user_email, validator_email, rfq_payload)"}), 400
 
-    # 2. Store State and Generate Token
+    # 2. Store State and Generate Token (Now uses PostgreSQL)
     request_id = str(uuid.uuid4())
-    validation_requests[request_id] = {
+    request_data = {
         'report_content': report_content,
         'user_email': user_email,
         'validator_email': validator_email,
-        'rfq_payload': rfq_payload, # Store the full RFQ payload here!
+        'rfq_payload': rfq_payload, 
         'status': 'PENDING',
         'validator_comments': None,
         'created_at': datetime.datetime.now().isoformat()
     }
+    set_request_data(request_id, request_data) # Store in DB
 
     # 3. Create Interactive Links
     confirm_link = f"{BASE_URL}/validate-page?id={request_id}&action=confirm"
@@ -489,58 +175,24 @@ def send_report_for_validation():
 
     # 4. Construct Email (HTML is essential for buttons)
     email_body_html = f"""
-    <html>
-        <body style="font-family: Arial, sans-serif; line-height: 1.6;">
-            <h2>Action Required: AI Report Validation</h2>
-            <p>A report generated by the AI assistant requires your review and validation. Please click one of the buttons below to proceed to the confirmation page and add comments.</p>
-            <hr>
-            <div style="padding: 15px; border: 1px solid #ccc; background-color: #f9f9f9; border-radius: 4px;">
-                <strong>Report Content:</strong>
-                <pre style="white-space: pre-wrap; font-family: monospace; font-size: 14px; margin: 10px 0;">{report_content}</pre>
-            </div>
-            <hr>
-
-            <table width="100%" border="0" cellspacing="0" cellpadding="0">
-                <tr>
-                    <td>
-                        <table border="0" cellspacing="0" cellpadding="0" style="margin: 20px 0;">
-                            <tr>
-                                <td align="center" style="border-radius: 4px;" bgcolor="#4CAF50">
-                                    <a href="{confirm_link}" target="_blank" style="font-size: 16px; font-weight: bold; font-family: Helvetica, Arial, sans-serif; color: #ffffff; text-decoration: none; padding: 15px 25px; border-radius: 4px; border: 1px solid #4CAF50; display: inline-block;">
-                                        CONFIRM REPORT
-                                    </a>
-                                </td>
+    <html><body style="font-family: Arial, sans-serif; line-height: 1.6;"><h2>Action Required: AI Report Validation</h2><p>A report generated by the AI assistant requires your review and validation. Please click one of the buttons below to proceed to the confirmation page and add comments.</p><hr><div style="padding: 15px; border: 1px solid #ccc; background-color: #f9f9f9; border-radius: 4px;"><strong>Report Content:</strong><pre style="white-space: pre-wrap; font-family: monospace; font-size: 14px; margin: 10px 0;">{report_content}</pre></div><hr>
+            <table width="100%" border="0" cellspacing="0" cellpadding="0"><tr><td><table border="0" cellspacing="0" cellpadding="0" style="margin: 20px 0;"><tr>
+                                <td align="center" style="border-radius: 4px;" bgcolor="#4CAF50"><a href="{confirm_link}" target="_blank" style="font-size: 16px; font-weight: bold; font-family: Helvetica, Arial, sans-serif; color: #ffffff; text-decoration: none; padding: 15px 25px; border-radius: 4px; border: 1px solid #4CAF50; display: inline-block;">CONFIRM REPORT</a></td>
                                 <td width="20"></td>
-                                <td align="center" style="border-radius: 4px;" bgcolor="#F44336">
-                                    <a href="{decline_link}" target="_blank" style="font-size: 16px; font-weight: bold; font-family: Helvetica, Arial, sans-serif; color: #ffffff; text-decoration: none; padding: 15px 25px; border-radius: 4px; border: 1px solid #F44336; display: inline-block;">
-                                        DECLINE REPORT
-                                    </a>
-                                </td>
-                            </tr>
-                        </table>
-                    </td>
-                </tr>
-            </table>
-
-            <p><small>Initiated by: {user_email}</small></p>
-        </body>
-    </html>
-    """
+                                <td align="center" style="border-radius: 4px;" bgcolor="#F44336"><a href="{decline_link}" target="_blank" style="font-size: 16px; font-weight: bold; font-family: Helvetica, Arial, sans-serif; color: #ffffff; text-decoration: none; padding: 15px 25px; border-radius: 4px; border: 1px solid #F44336; display: inline-block;">DECLINE REPORT</a></td>
+                            </tr></table></td></tr></table>
+            <p><small>Initiated by: {user_email}</small></p></body></html>"""
 
     # 5. Send Email
     msg = Message("AI Report Validation Required", recipients=[validator_email])
     msg.html = email_body_html
-
     ok, err = safe_send_mail(msg)
 
     if not ok:
         return jsonify({"message": "Failed to send email via SMTP.", "error": err}), 500
 
     print(f"DEBUG: Validation request created with ID: {request_id}")
-    return jsonify({
-        "message": "Validation email sent successfully.",
-        "request_id": request_id
-    }), 200
+    return jsonify({"message": "Validation email sent successfully.", "request_id": request_id}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -548,140 +200,82 @@ def send_report_for_validation():
 # ---------------------------------------------------------------------------
 @app.route('/validate-page')
 def validate_page():
-    # DEBUG LOG: Show the request parameters
     print(f"DEBUG: Endpoint /validate-page hit. Args: {request.args}")
-
     request_id = request.args.get('id')
-    action = request.args.get('action')  # 'confirm' or 'decline'
+    action = request.args.get('action') 
 
-    if request_id not in validation_requests:
+    # Retrieval from PostgreSQL
+    request_data = get_request_data(request_id)
+    
+    if request_data is None:
         return "Error: Invalid or expired validation request.", 404
 
-    request_data = validation_requests[request_id]
     report_content = request_data['report_content']
     status = request_data['status']
 
     if status != 'PENDING':
-        return f"""<!DOCTYPE html>
-        <html><body style='font-family: Arial; text-align: center; padding: 50px;'>
-        <h1 style='color: gray;'>Already Processed</h1>
-        <p>This report has already been <strong>{status}</strong>.</p>
-        </body></html>""", 400
+        return f"""<!DOCTYPE html><html><body style='font-family: Arial; text-align: center; padding: 50px;'><h1 style='color: gray;'>Already Processed</h1><p>This report has already been <strong>{status}</strong>.</p></body></html>""", 400
 
-    # Determine visual styles and messages based on action
     if action == 'confirm':
-        title = "Confirm AI Report"
-        action_text = "Confirm"
-        color = "#4CAF50"  # Green
+        title, action_text, color = "Confirm AI Report", "Confirm", "#4CAF50"
     elif action == 'decline':
-        title = "Decline AI Report"
-        action_text = "Decline"
-        color = "#F44336"  # Red
+        title, action_text, color = "Decline AI Report", "Decline", "#F44336"
     else:
         return "Error: Invalid action specified.", 400
 
     # The HTML for the responsive landing page
     html_content = f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>{title}</title>
-        <style>
-            body {{ font-family: 'Inter', sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; }}
-            .container {{ max-width: 800px; margin: 0 auto; background-color: #ffffff; padding: 25px; border-radius: 12px; box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15); }}
-            h1 {{ color: {color}; text-align: center; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-bottom: 25px; }}
-            .report-box {{ background-color: #f0f8ff; border: 1px solid #cceeff; padding: 15px; border-radius: 8px; margin-bottom: 20px; white-space: pre-wrap; font-family: monospace; font-size: 0.95em; }}
-            label {{ display: block; margin-bottom: 10px; font-weight: bold; color: #333; }}
-            textarea {{ width: 100%; padding: 12px; box-sizing: border-box; border: 2px solid #ccc; border-radius: 6px; resize: vertical; min-height: 150px; transition: border-color 0.3s; }}
-            textarea:focus {{ border-color: #007acc; outline: none; }}
-            .submit-btn {{ background-color: {color}; color: white; padding: 14px 25px; border: none; border-radius: 6px; cursor: pointer; font-size: 17px; font-weight: bold; width: 100%; margin-top: 20px; transition: background-color 0.3s, transform 0.1s; }}
-            .submit-btn:hover {{ opacity: 0.9; transform: translateY(-1px); }}
-            @media (max-width: 600px) {{ .container {{ padding: 15px; }} h1 {{ font-size: 1.5em; }} }}
-        </style>
+    <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title}</title>
+        <style>body {{ font-family: 'Inter', sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; }} .container {{ max-width: 800px; margin: 0 auto; background-color: #ffffff; padding: 25px; border-radius: 12px; box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15); }} h1 {{ color: {color}; text-align: center; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-bottom: 25px; }} .report-box {{ background-color: #f0f8ff; border: 1px solid #cceeff; padding: 15px; border-radius: 8px; margin-bottom: 20px; white-space: pre-wrap; font-family: monospace; font-size: 0.95em; }} label {{ display: block; margin-bottom: 10px; font-weight: bold; color: #333; }} textarea {{ width: 100%; padding: 12px; box-sizing: border-box; border: 2px solid #ccc; border-radius: 6px; resize: vertical; min-height: 150px; transition: border-color 0.3s; }} textarea:focus {{ border-color: #007acc; outline: none; }} .submit-btn {{ background-color: {color}; color: white; padding: 14px 25px; border: none; border-radius: 6px; cursor: pointer; font-size: 17px; font-weight: bold; width: 100%; margin-top: 20px; transition: background-color 0.3s, transform 0.1s; }} .submit-btn:hover {{ opacity: 0.9; transform: translateY(-1px); }} @media (max-width: 600px) {{ .container {{ padding: 15px; }} h1 {{ font-size: 1.5em; }} }}</style>
     </head>
-    <body>
-        <div class="container">
-            <h1>{title}</h1>
-
-            <h2>AI Report Content</h2>
-            <div class="report-box">
-                {report_content}
-            </div>
-
-            <form action="/api/handle-validation" method="post">
-                <input type="hidden" name="request_id" value="{request_id}">
-                <input type="hidden" name="action" value="{action}">
-
-                <label for="comments">Validator Comments (Required for final decision):</label>
-                <textarea id="comments" name="comments" placeholder="Enter comments regarding your decision..." required></textarea>
-
+    <body><div class="container"><h1>{title}</h1><h2>AI Report Content</h2><div class="report-box">{report_content}</div>
+            <form action="/api/handle-validation" method="post"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="action" value="{action}">
+                <label for="comments">Validator Comments (Required for final decision):</label><textarea id="comments" name="comments" placeholder="Enter comments regarding your decision..." required></textarea>
                 <button type="submit" class="submit-btn">{action_text} and Submit to Database</button>
-            </form>
-
-            <p style="text-align: center; margin-top: 30px;"><small>Report ID: {request_id}</small></p>
-        </div>
-    </body>
-    </html>
-    """
+            </form><p style="text-align: center; margin-top: 30px;"><small>Report ID: {request_id}</small></p></div></body></html>"""
     return html_content
 
 
 # --------------------------------------------------------------------------------------------------
 # --- 3. VALIDATION HANDLER ENDPOINT (Receives form data, updates state, and submits to DB) ---
 # --------------------------------------------------------------------------------------------------
-
-
-
-
-
 @app.route('/api/handle-validation', methods=['POST'])
 def handle_validation():
-    # DEBUG LOG: Confirm method and form data keys
     print(f"DEBUG: Endpoint /api/handle-validation hit with method: {request.method}")
-    print(f"DEBUG: Received form keys: {list(request.form.keys())}")
-
-    # Get form data from the landing page
+    
     request_id = request.form.get('request_id')
-    action = request.form.get('action')  # 'confirm' or 'decline'
+    action = request.form.get('action')
     comments = request.form.get('comments')
 
-    # Basic retrieval and status check
-    if request_id not in validation_requests:
-        print(f"DEBUG: Invalid request ID received: {request_id}")
-        return "Error: Invalid request ID.", 404
+    # Retrieval from PostgreSQL
+    request_data = get_request_data(request_id)
 
-    request_data = validation_requests[request_id]
+    if request_data is None:
+        return "Error: Invalid or expired validation request.", 404
     if request_data['status'] != 'PENDING':
-        print(f"DEBUG: Request {request_id} already processed.")
         return "Error: This report has already been processed.", 400
 
-    # 1. Update Mock Database (Status and Comments)
+    # 1. Update Persistent State (Status and Comments)
     request_data['status'] = action.upper()
     request_data['validator_comments'] = comments
     request_data['validated_at'] = datetime.datetime.now().isoformat()
+    set_request_data(request_id, request_data) # Update state in DB
 
     # --- 2. Prepare Final RFQ Payload for External API ---
-    
-    # Retrieve the original, structured RFQ data provided by the AI assistant.
     original_rfq_payload = request_data.get('rfq_payload')
     
-    # CRITICAL FIX: Handle 'NoneType' error if original payload is missing
     if not isinstance(original_rfq_payload, dict):
-        db_submission_error = "FATAL: Original RFQ structured data ('rfq_payload') is missing or invalid in internal storage."
-        print(f"ERROR: {db_submission_error}")
-        # Set status to failure to skip submission attempt below
+        db_submission_error = "FATAL: Original RFQ structured data ('rfq_payload') is missing or invalid."
         db_submission_status = "FAILED"
         payload_to_send = None
     else:
         # Create the final payload by safely merging the original data with the new validation fields
         payload_to_send = {
             **original_rfq_payload,
-            "status": action.upper(),        # Maps to the new 'status' column in PostgreSQL
-            "validator_comments": comments   # Maps to the new 'validator_comments' column in PostgreSQL
+            "status": [action.upper()],        # CRITICAL FIX: Array for PostgreSQL
+            "validator_comments": comments   
         }
-        db_submission_status = "PENDING" # Reset for submission attempt
+        db_submission_status = "PENDING"
 
     # 3. Synchronously Submit to External Database API
     db_submission_error = ""
@@ -694,7 +288,7 @@ def handle_validation():
                 json=payload_to_send, 
                 headers={"Content-Type": "application/json"}
             )
-            response.raise_for_status() # Raises an HTTPError if the status is 4xx or 5xx
+            response.raise_for_status() 
             db_submission_status = "SUCCESS"
             print(f"DEBUG: External RFQ submission successful. Status: {response.status_code}")
         except requests.exceptions.RequestException as e:
@@ -708,237 +302,296 @@ def handle_validation():
     subject = f"✅ Report {action.upper()} - Final Decision" if action == 'confirm' else f"❌ Report {action.upper()} - Final Decision"
     
     final_email_body_html = f"""
-    <html>
-        <body style="font-family: Arial, sans-serif; line-height: 1.6;">
-            <h2>Your AI Report Validation Result</h2>
-            <p>The validator, <strong>{request_data['validator_email']}</strong>, has finished reviewing your report.</p>
-            <hr>
-
-            <h3 style="color: {color};">Decision: {action.upper()}</h3>
-            <h4>Validator Comments:</h4>
-            <div style="border-left: 5px solid {color}; padding: 10px; background-color: #e9f5ff; border-radius: 0 4px 4px 0; margin-bottom: 20px;">
-                <p style="margin: 0;">{comments}</p>
-            </div>
-            
+    <html><body style="font-family: Arial, sans-serif; line-height: 1.6;"><h2>Your AI Report Validation Result</h2><p>The validator, <strong>{request_data['validator_email']}</strong>, has finished reviewing your report.</p><hr>
+            <h3 style="color: {color};">Decision: {action.upper()}</h3><h4>Validator Comments:</h4><div style="border-left: 5px solid {color}; padding: 10px; background-color: #e9f5ff; border-radius: 0 4px 4px 0; margin-bottom: 20px;"><p style="margin: 0;">{comments}</p></div>
             <h4>Database Submission Status: <span style="color: {'#4CAF50' if db_submission_status == 'SUCCESS' else '#F44336'};">{db_submission_status}</span></h4>
-            {f'<p style="color: #F44336;">Error Details: {db_submission_error}</p>' if db_submission_status != 'SUCCESS' else ''}
-
-            <p style="margin-top: 20px;">Thank you for using the AI Assistant.</p>
-        </body>
-    </html>
+            {f'<p style="color: #F44336;">Error Details: {db_submission_error}</p>' if db_submission_status != 'SUCCESS' else ''}<p style="margin-top: 20px;">Thank you for using the AI Assistant.</p></body></html>
     """
-
     msg = Message(subject, recipients=[user_email])
     msg.html = final_email_body_html
-    # Send notification email synchronously
     safe_send_mail(msg) 
 
     # 5. Show Success/Failure Page to Validator
     if db_submission_status != 'SUCCESS':
-        # ERROR PAGE (HTTP 500)
-        return f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <title>Submission Failed</title>
-            <style>
-                body {{ font-family: 'Inter', sans-serif; text-align: center; padding: 50px; background-color: #fef2f2; }}
-                .card {{ max-width: 720px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px;
-                         box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-left: 6px solid #dc2626; }}
-                h1 {{ color: #dc2626; margin-bottom: 6px; }}
-                pre {{ text-align: left; white-space: pre-wrap; background:#fff7ed; padding:12px; border-radius:6px; border:1px solid #fed7aa }}
-            </style>
-        </head>
-        <body>
-            <div class="card">
-                <h1>Decision Saved, Database Submission Failed</h1>
-                <p>Your validation decision was saved, but the final RFQ data could not be submitted to the external database API.</p>
-                <h3 style="margin-top:18px;">Error Details</h3>
-                <pre>{db_submission_error}</pre>
-                <p>The user was notified of this failure via email.</p>
-            </div>
-        </body>
-        </html>
-        """, 500
+        return f"""<!DOCTYPE html><html lang="en"><head><title>Submission Failed</title><style>body {{ font-family: 'Inter', sans-serif; text-align: center; padding: 50px; background-color: #fef2f2; }} .card {{ max-width: 720px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-left: 6px solid #dc2626; }} h1 {{ color: #dc2626; margin-bottom: 6px; }} pre {{ text-align: left; white-space: pre-wrap; background:#fff7ed; padding:12px; border-radius:6px; border:1px solid #fed7aa }}</style></head>
+        <body><div class="card"><h1>Decision Saved, Database Submission Failed</h1><p>Your validation decision was saved, but the final RFQ data could not be submitted to the external database API.</p><h3 style="margin-top:18px;">Error Details</h3><pre>{db_submission_error}</pre><p>The user was notified of this failure via email.</p></div></body></html>""", 500
 
-    # SUCCESS PAGE (HTTP 200)
-    return f"""
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <title>Success</title>
-        <style>
-            body {{ font-family: 'Inter', sans-serif; text-align: center; padding: 50px; background-color: #f4f4f4; }}
-            .card {{ max-width: 720px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px;
-                     box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-left: 6px solid {color}; }}
-            h1 {{ color: {color}; }}
-            p {{ color: #4b5563; }}
-            .pill {{ display:inline-block; padding: 6px 10px; border-radius: 9999px; background:#ecfdf5; color:#065f46; font-weight:600; }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h1>Validation Complete!</h1>
-            <p class="pill">Decision: {action.upper()}</p>
-            <p style="margin-top:14px;">Your decision has been recorded and the final RFQ data was successfully submitted to the database.</p>
-            <p style="margin-top:18px;"><a href="/" style="color:#2563eb; text-decoration:none;">Return to start</a></p>
-        </div>
-    </body>
-    </html>
+    return f"""<!DOCTYPE html><html lang="en"><head><title>Success</title><style>body {{ font-family: 'Inter', sans-serif; text-align: center; padding: 50px; background-color: #f4f4f4; }} .card {{ max-width: 720px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-left: 6px solid {color}; }} h1 {{ color: {color}; }} p {{ color: #4b5563; }} .pill {{ display:inline-block; padding: 6px 10px; border-radius: 9999px; background:#ecfdf5; color:#065f46; font-weight:600; }}</style></head>
+    <body><div class="card"><h1>Validation Complete!</h1><p class="pill">Decision: {action.upper()}</p><p style="margin-top:14px;">Your decision has been recorded and the final RFQ data was successfully submitted to the database.</p><p style="margin-top:18px;"><a href="/" style="color:#2563eb; text-decoration:none;">Return to start</a></p></div></body></html>"""
+
+
+# --- 3. API ENDPOINTS (Submission and Retrieval Endpoints) ---
+
+@app.route('/api/rfq/submit', methods=['POST'])
+def submit_rfq_data():
     """
-
-
-
-
-
-
-
-
-# ----------------------------------------------------------------------
-
-@app.route('/api/product-lines', methods=['GET'])
-def retrieve_product_line_modified():
+    Receives structured RFQ data, including top-level validation status and comments, 
+    and inserts it into the main and contact tables. (Mocking external API logic)
     """
-    Retrieves product line data from the 'product_lines' table using a required ID.
-    (Used to identify {Product_Line} automatically after product selection in Step 1)
-    """
-    # Changed parameter name to reflect the required foreign key
-    product_line_id = request.args.get('productLineId') 
+    data = request.get_json()
+    conn = None
+    rfq_id = None
+    
+    if not data:
+        return jsonify({"status": "error", "message": "No data provided"}), 400
 
-    # 1. Parameter Validation (Required: productLineId)
-    if not product_line_id:
-        return jsonify({
-            "error": "Missing required query parameter: productLineId",
-            "details": "The ID of the product line must be provided to retrieve its details."
-        }), 400 
+    rfq_id = data.get('rfq_id')
+    if not rfq_id:
+        return jsonify({"status": "error", "message": "Missing required field: rfq_id"}), 400
+
+    # --- Extract Validation Data from the top level ---
+    final_status = data.pop('status', None) 
+    final_validator_comments = data.pop('validator_comments', None)
+
+    try:
+        conn, cursor = get_db()
+        
+        # --- CONTACT HANDLING ---
+        contact_data = data.get('contact', {})
+        contact_email = contact_data.get('email')
+        
+        if not contact_email:
+            conn.close()
+            return jsonify({"status": "error", "message": "Missing required contact field: email"}), 400
+
+        contact_id_fk = None
+
+        cursor.execute("SELECT contact_id FROM contact WHERE contact_email = %s", (contact_email,))
+        existing_contact = cursor.fetchone()
+
+        if existing_contact:
+            contact_id_fk = existing_contact['contact_id']
+        else:
+            insert_contact_sql = "INSERT INTO contact (contact_role, contact_email, contact_phone) VALUES (%s, %s, %s) RETURNING contact_id;"
+            cursor.execute(insert_contact_sql, (contact_data.get('role'), contact_data.get('email'), contact_data.get('phone')))
+            contact_id_fk = cursor.fetchone()['contact_id']
+
+        # --- MAIN RFQ INSERTION ---
+
+        # 2. Prepare main data fields
+        main_fields = {
+            'rfq_id': rfq_id, 'customer_name': data.get('customer_name'), 'application': data.get('application'), 'product_line': data.get('product_line'), 'customer_pn': data.get('customer_pn'), 'revision_level': data.get('revision_level'), 'delivery_zone': data.get('delivery_zone'), 'delivery_plant': data.get('delivery_plant'), 'sop_year': data.get('sop_year'), 'annual_volume': data.get('annual_volume'), 'rfq_reception_date': data.get('rfq_reception_date'), 'quotation_expected_date': data.get('quotation_expected_date'), 'target_price_eur': data.get('target_price_eur'), 'delivery_conditions': data.get('delivery_conditions'), 'payment_terms': data.get('payment_terms'), 'business_trigger': data.get('business_trigger'), 'entry_barriers': data.get('entry_barriers'), 'product_feasibility_note': data.get('product_feasibility_note'), 'manufacturing_location': data.get('manufacturing_location'), 'risks': data.get('risks'),
+            'decision': data.get('decision'), 'strategic_note': data.get('strategic_note'),
+            'design_responsibility': data.get('design_responsibility'), 'validation_responsibility': data.get('validation_responsibility'), 'design_ownership': data.get('design_ownership'), 'development_costs': data.get('development_costs'), 'technical_capacity': convert_to_boolean(data.get('technical_capacity', 'maybe')), 'scope_alignment': convert_to_boolean(data.get('scope_alignment', 'maybe')), 'overall_feasibility': data.get('overall_feasibility'), 'customer_status': data.get('customer_status'), 'final_recommendation': data.get('final_recommendation'),
+            # VALIDATOR FIELDS (New Columns)
+            'status': final_status, 
+            'validator_comments': final_validator_comments, 
+            
+            'contact_id_fk': contact_id_fk
+        }
+        
+        main_columns = ', '.join(main_fields.keys())
+        main_placeholders = ', '.join(['%s'] * len(main_fields))
+        main_values = list(main_fields.values())
+
+        insert_main_sql = f"INSERT INTO main ({main_columns}) VALUES ({main_placeholders})"
+        
+        cursor.execute(insert_main_sql, main_values)
+        conn.commit()
+
+        return jsonify({"status": "success", "message": "RFQ data successfully stored.", "rfq_id": rfq_id}), 200
+
+    except ConnectionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    except OperationalError as e:
+        if conn: conn.rollback()
+        pg_error_message = getattr(e, 'pgerror', None)
+        detail_message = pg_error_message.strip() if pg_error_message else str(e)
+
+        return jsonify({"status": "error", "message": f"Database insertion failed (PostgreSQL Error): {detail_message}", "rfq_id": rfq_id if rfq_id else None}), 500
+    except Exception as e:
+        if conn: conn.rollback()
+        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
+        
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+@app.route('/api/rfq/get', methods=['GET'])
+def get_rfq_data():
+    """Retrieves RFQ data based on dynamic query parameters (rfq_id, customer_name, product_line)."""
+    
+    rfq_id = request.args.get('rfq_id')
+    customer_name = request.args.get('customer_name')
+    product_line = request.args.get('product_line')
+    
+    where_clauses = []
+    query_params = []
+    
+    if rfq_id:
+        where_clauses.append("m.rfq_id = %s")
+        query_params.append(rfq_id)
+    if customer_name:
+        where_clauses.append("m.customer_name ILIKE %s")
+        query_params.append(f"%{customer_name}%") 
+    if product_line:
+        where_clauses.append("m.product_line = %s")
+        query_params.append(product_line)
+
+    if not where_clauses:
+        return jsonify({"status": "error", "message": "At least one search parameter (rfq_id, customer_name, or product_line) is required."}), 400
+
+    where_sql = " AND ".join(where_clauses)
+    
+    conn = None
+    try:
+        conn, cursor = get_db()
+        select_sql = f"""
+        SELECT m.*, c.contact_role, c.contact_email, c.contact_phone
+        FROM main m
+        INNER JOIN contact c ON m.contact_id_fk = c.contact_id
+        WHERE {where_sql}
+        ORDER BY m.rfq_reception_date DESC;
+        """
+        
+        cursor.execute(select_sql, tuple(query_params))
+        results = cursor.fetchall()
+        
+        if not results:
+            return jsonify({"status": "success", "message": "No RFQ records found matching the criteria.", "data": []}), 200
+
+        # --- Formatting Results ---
+        formatted_results = []
+        for row in results:
+            rfq_data = dict(row)
+            contact = {
+                'role': rfq_data.pop('contact_role', None),
+                'email': rfq_data.pop('contact_email', None),
+                'phone': rfq_data.pop('contact_phone', None)
+            }
+            rfq_data.pop('contact_id_fk', None) 
+            rfq_data.pop('contact_id', None)
+            rfq_data['contact'] = contact
+            formatted_results.append(rfq_data)
+
+        return jsonify({"status": "success", "message": f"Retrieved {len(formatted_results)} RFQ record(s).", "data": formatted_results}), 200
+
+    except ConnectionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    except OperationalError as e:
+        print(f"PostgreSQL query failed: {e}")
+        return jsonify({"status": "error", "message": f"Database query failed: {str(e)}", "query_params": request.args}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
+        
+    finally:
+        if conn: conn.close()
+
+
+@app.route('/api/products', methods=['GET'])
+def retrieve_products_modified():
+    """Retrieves product data from the 'products' table."""
+    product_name = request.args.get('productName')
 
     conn = None
     try:
         conn, cursor = get_db()
-
-        # 2. SQL Query: Exact match on the 'id' column
-        query = """
-            SELECT *
-            FROM public.product_lines
-            WHERE id = %s;
+        
+        select_columns = """
+            id, product_name, product_line, description, product_definition, 
+            operating_environment, technical_parameters, machines_and_tooling, 
+            manufacturing_strategy, purchasing_strategy, prototypes_ppap_and_sop, 
+            engineering_and_testing, capacity, our_advantages, gmdc_pct, 
+            product_line_id, customers_in_production, customer_in_development, 
+            level_of_interest_and_why, estimated_price_per_product, 
+            prod_if_customer_in_china, costing_data, created_at
         """
+        
+        query = f"SELECT {select_columns} FROM public.products"
+        search_pattern = None
+        
+        if product_name:
+            query += " WHERE product_name ILIKE %s"
+            search_pattern = f"%{product_name}%"
+            cursor.execute(query, (search_pattern,))
+        else:
+            cursor.execute(query) 
+
+        products_data = cursor.fetchall()
+        
+        return jsonify({"query": product_name if product_name else "All Products", "products": products_data, "source": "database"}), 200
+
+    except ConnectionError as e:
+        return jsonify({"error": str(e), "details": "Database connection failed."}), 500
+    except OperationalError as e:
+        pg_error_message = getattr(e, 'pgerror', str(e))
+        return jsonify({"error": "Error retrieving products from the database", "details": pg_error_message}), 400
+        
+    finally:
+        if conn: conn.close()
+
+
+@app.route('/api/product-lines', methods=['GET'])
+def retrieve_product_line_modified():
+    """Retrieves product line data from the 'product_lines' table using a required ID."""
+    product_line_id = request.args.get('productLineId') 
+
+    if not product_line_id:
+        return jsonify({"error": "Missing required query parameter: productLineId", "details": "The ID of the product line must be provided to retrieve its details."}), 400 
+
+    conn = None
+    try:
+        conn, cursor = get_db()
+        query = "SELECT * FROM public.product_lines WHERE id = %s;"
         cursor.execute(query, (product_line_id,))
 
         product_line_data = cursor.fetchall()
 
-        # 3. Format and Send Response (200 OK)
-        return jsonify({
-            "query": product_line_id,
-            "productLine": product_line_data, 
-            "source": "database"
-        }), 200
+        return jsonify({"query": product_line_id, "productLine": product_line_data, "source": "database"}), 200
 
     except ConnectionError as e:
         return jsonify({"error": str(e), "details": "Database connection failed."}), 500
-
     except OperationalError as e:
         pg_error_message = getattr(e, 'pgerror', str(e))
-        return jsonify({
-            "error": "Error retrieving product-line items from the database",
-            "details": pg_error_message
-        }), 400
+        return jsonify({"error": "Error retrieving product-line items from the database", "details": pg_error_message}), 400
 
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
 
 
 @app.route('/api/product-lines/list', methods=['GET'])
 def list_product_lines():
-    """
-    Retrieves the list of all product lines (ID and Name) for selection menus.
-    This API does NOT require any parameters.
-    """
+    """Retrieves the list of all product lines (ID and Name) for selection menus."""
     conn = None
     try:
-        # Assurez-vous d'avoir une fonction get_db() qui retourne la connexion et le curseur
-        # Make sure you have a working get_db() function returning connection and cursor
         conn, cursor = get_db()
-
-        # 1. Requête SQL pour obtenir uniquement les ID et les noms (ou texte)
-        # SQL query to get only the ID and Name (or text)
-        query = """
-            SELECT id, name AS product_line_name, type_of_products AS description_snippet
-            FROM public.product_lines
-            ORDER BY id;
-        """
+        query = "SELECT id, name AS product_line_name, type_of_products AS description_snippet FROM public.product_lines ORDER BY id;"
         cursor.execute(query)
 
         product_lines_list = cursor.fetchall()
 
-        # 2. Format et Envoi de la Réponse (200 OK)
-        # Format and Send Response (200 OK)
-        return jsonify({
-            "productLinesList": product_lines_list,
-            "count": len(product_lines_list),
-            "source": "database"
-        }), 200
+        return jsonify({"productLinesList": product_lines_list, "count": len(product_lines_list), "source": "database"}), 200
 
     except ConnectionError as e:
         return jsonify({"error": str(e), "details": "Database connection failed."}), 500
-
     except OperationalError as e:
         pg_error_message = getattr(e, 'pgerror', str(e))
-        return jsonify({
-            "error": "Error retrieving product lines list from the database",
-            "details": pg_error_message
-        }), 400
+        return jsonify({"error": "Error retrieving product lines list from the database", "details": pg_error_message}), 400
 
     finally:
-        if conn:
-            conn.close()
+        if conn: conn.close()
 
 @app.route('/api/product-lines/details', methods=['GET'])
 def get_product_line_by_product_name():
-    """
-    Retrieves product line details based on a given product name.
-    Useful when the client app only knows the product name and 
-    needs to find the related product line info.
-    """
+    """Retrieves product line details based on a given product name."""
     product_name = request.args.get('productName')
 
-    # 1. Validate parameter
     if not product_name:
-        return jsonify({
-            "error": "Missing required query parameter: productName",
-            "details": "Provide a valid product name to retrieve product-line details."
-        }), 400
+        return jsonify({"error": "Missing required query parameter: productName", "details": "Provide a valid product name to retrieve product-line details."}), 400
 
     conn = None
-    cursor = None
     try:
         conn, cursor = get_db()
 
-        # 2. Query to join products and product_lines tables
-        # Using only columns that actually exist in both tables
         query = """
-            SELECT 
-                pl.id AS product_line_id,
-                pl.name AS product_line_name,
-                pl.type_of_products,
-                pl.manufacturing_locations,
-                pl.design_center,
-                pl.product_line_manager,
-                pl.type_of_customers,
-                pl.metiers,
-                pl.strength,
-                pl.weakness,
-                pl.perspectives,
-                pl.history,
-                p.id AS product_id,
-                p.product_name,
-                p.description AS product_description,
-                p.product_definition,
-                p.operating_environment,
-                p.technical_parameters
+            SELECT pl.id AS product_line_id, pl.name AS product_line_name, pl.type_of_products,
+                   pl.manufacturing_locations, pl.design_center, pl.product_line_manager,
+                   pl.type_of_customers, pl.metiers, pl.strength, pl.weakness, pl.perspectives,
+                   pl.history, p.id AS product_id, p.product_name, p.description AS product_description,
+                   p.product_definition, p.operating_environment, p.technical_parameters
             FROM public.products p
-            INNER JOIN public.product_lines pl 
-                ON p.product_line_id = pl.id
+            INNER JOIN public.product_lines pl ON p.product_line_id = pl.id
             WHERE p.product_name ILIKE %s;
         """
 
@@ -946,44 +599,24 @@ def get_product_line_by_product_name():
         results = cursor.fetchall()
 
         if not results:
-            return jsonify({
-                "status": "success",
-                "message": "No product line found matching the provided product name.",
-                "data": []
-            }), 200
+            return jsonify({"status": "success", "message": "No product line found matching the provided product name.", "data": []}), 200
 
-        return jsonify({
-            "status": "success",
-            "message": f"Retrieved {len(results)} product-line record(s) for '{product_name}'.",
-            "data": results
-        }), 200
+        return jsonify({"status": "success", "message": f"Retrieved {len(results)} product-line record(s).", "data": results}), 200
 
     except ConnectionError as e:
         return jsonify({"error": str(e), "details": "Database connection failed."}), 500
-
     except OperationalError as e:
         pg_error_message = getattr(e, 'pgerror', str(e))
-        return jsonify({
-            "error": "Error retrieving product-line details from the database",
-            "details": pg_error_message
-        }), 500
-
+        return jsonify({"error": "Error retrieving product-line details from the database", "details": pg_error_message}), 500
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
         print(error_details)
-        return jsonify({
-            "error": "An unexpected error occurred",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
 
     finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+        if conn: conn.close()
+
 
 if __name__ == '__main__':
-    # When running locally, set the FLASK_APP environment variable.
-    # On Azure, gunicorn will handle execution.
     app.run(debug=True)
