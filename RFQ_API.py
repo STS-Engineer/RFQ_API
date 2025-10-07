@@ -311,7 +311,7 @@ def handle_validation():
         # Create the final payload by safely merging the original data with the new validation fields
         payload_to_send = {
             **original_rfq_payload,
-            "status": [action.upper()],        # CRITICAL FIX: Array for PostgreSQL
+            "status": action.upper(),        # CRITICAL FIX: Array for PostgreSQL
             "validator_comments": comments   
         }
         db_submission_status = "PENDING"
