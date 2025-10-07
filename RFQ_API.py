@@ -67,16 +67,19 @@ def convert_to_boolean(value):
 # --- PERSISTENT STATE MANAGEMENT FUNCTIONS (PostgreSQL) ---
 
 def get_request_data(request_id):
-    """Retrieves pending request data from the database."""
+    """
+    Retrieves request data regardless of status. 
+    NOTE: Removed 'AND status = PENDING' filter to allow checking final status.
+    """
     conn = None
     try:
         conn, cursor = get_db()
-        # Only look for PENDING requests
-        cursor.execute("SELECT data FROM pending_validations WHERE request_id = %s AND status = 'PENDING';", (request_id,))
+        # Retrieve the data regardless of status
+        cursor.execute("SELECT data FROM pending_validations WHERE request_id = %s;", (request_id,))
         result = cursor.fetchone()
         
         if result and 'data' in result:
-            return result['data'] # Data is returned as a dict by psycopg2 from JSONB
+            return result['data'] 
         return None
     except ConnectionError:
         return None 
@@ -93,14 +96,12 @@ def set_request_data(request_id, data):
     try:
         conn, cursor = get_db()
         
-        # Use ON CONFLICT DO UPDATE to handle both inserts (initial request) and updates (validation click)
         insert_sql = """
             INSERT INTO pending_validations (request_id, data, status)
             VALUES (%s, %s, %s)
             ON CONFLICT (request_id) DO UPDATE
             SET data = EXCLUDED.data, status = EXCLUDED.status, created_at = NOW();
         """
-        # Store the Python dict 'data' by explicitly converting it to a JSON string for JSONB column
         cursor.execute(insert_sql, (request_id, json.dumps(data), data['status'])) 
         conn.commit()
     except Exception as e:
@@ -209,11 +210,49 @@ def validate_page():
     if request_data is None:
         return "Error: Invalid or expired validation request.", 404
 
+    # --- FIX: Extract necessary variables now, before conditional checks ---
     report_content = request_data['report_content']
     status = request_data['status']
+    
+    # Extract other variables needed for the 'Processed' status page below
+    validated_at = request_data.get('validated_at', 'N/A')
+    comments = request_data.get('validator_comments', 'No comments provided.')
 
     if status != 'PENDING':
-        return f"""<!DOCTYPE html><html><body style='font-family: Arial; text-align: center; padding: 50px;'><h1 style='color: gray;'>Already Processed</h1><p>This report has already been <strong>{status}</strong>.</p></body></html>""", 400
+        # Case 3: Already Processed (CONFIRMED or DECLINED) - Show Status Page
+        final_action = status
+        color = '#4CAF50' if final_action == 'CONFIRMED' else '#F44336'
+        
+        return f"""
+        <!DOCTYPE html><html lang="en"><head><title>Processed</title>
+        <style>
+            body {{ font-family: 'Inter', sans-serif; text-align: center; padding: 50px; background-color: #f4f4f4; }} 
+            .card {{ max-width: 720px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15); border-left: 6px solid {color}; }} 
+            h1 {{ color: {color}; margin-bottom: 20px; }} 
+            h3 {{ margin-top: 25px; border-bottom: 1px solid #eee; padding-bottom: 5px; }}
+            .comment-box {{ background-color: #f0f8ff; border: 1px solid #cceeff; padding: 15px; border-radius: 4px; text-align: left; }}
+        </style>
+        </head>
+        <body>
+            <div class="card">
+                <h1>Report Already {final_action}!</h1>
+                <p style="font-size: 1.1em;">This report was previously finalized by a validator.</p>
+                
+                <h3>Decision Details</h3>
+                <p><strong>Action Taken:</strong> <span style="color: {color}; font-weight: bold;">{final_action}</span></p>
+                <p><strong>Processed On:</strong> {validated_at}</p>
+                
+                <h3>Validator Comments</h3>
+                <div class="comment-box">
+                    {comments}
+                </div>
+                <p style="margin-top: 20px;"><a href="/">Return to start</a></p>
+            </div>
+        </body>
+        </html>
+        """, 200
+
+    # Case 2: Status is PENDING - Proceed to show the submission form
 
     if action == 'confirm':
         title, action_text, color = "Confirm AI Report", "Confirm", "#4CAF50"
@@ -222,7 +261,7 @@ def validate_page():
     else:
         return "Error: Invalid action specified.", 400
 
-    # The HTML for the responsive landing page
+    # The HTML for the responsive landing page (uses defined report_content)
     html_content = f"""
     <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title}</title>
         <style>body {{ font-family: 'Inter', sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; }} .container {{ max-width: 800px; margin: 0 auto; background-color: #ffffff; padding: 25px; border-radius: 12px; box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15); }} h1 {{ color: {color}; text-align: center; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-bottom: 25px; }} .report-box {{ background-color: #f0f8ff; border: 1px solid #cceeff; padding: 15px; border-radius: 8px; margin-bottom: 20px; white-space: pre-wrap; font-family: monospace; font-size: 0.95em; }} label {{ display: block; margin-bottom: 10px; font-weight: bold; color: #333; }} textarea {{ width: 100%; padding: 12px; box-sizing: border-box; border: 2px solid #ccc; border-radius: 6px; resize: vertical; min-height: 150px; transition: border-color 0.3s; }} textarea:focus {{ border-color: #007acc; outline: none; }} .submit-btn {{ background-color: {color}; color: white; padding: 14px 25px; border: none; border-radius: 6px; cursor: pointer; font-size: 17px; font-weight: bold; width: 100%; margin-top: 20px; transition: background-color 0.3s, transform 0.1s; }} .submit-btn:hover {{ opacity: 0.9; transform: translateY(-1px); }} @media (max-width: 600px) {{ .container {{ padding: 15px; }} h1 {{ font-size: 1.5em; }} }}</style>
@@ -233,7 +272,6 @@ def validate_page():
                 <button type="submit" class="submit-btn">{action_text} and Submit to Database</button>
             </form><p style="text-align: center; margin-top: 30px;"><small>Report ID: {request_id}</small></p></div></body></html>"""
     return html_content
-
 
 # --------------------------------------------------------------------------------------------------
 # --- 3. VALIDATION HANDLER ENDPOINT (Receives form data, updates state, and submits to DB) ---
@@ -251,6 +289,8 @@ def handle_validation():
 
     if request_data is None:
         return "Error: Invalid or expired validation request.", 404
+    # The PENDING status check is redundant here because the validation form should only be accessible
+    # if the status is PENDING. However, we keep it for defense in depth.
     if request_data['status'] != 'PENDING':
         return "Error: This report has already been processed.", 400
 
@@ -325,7 +365,7 @@ def handle_validation():
 def submit_rfq_data():
     """
     Receives structured RFQ data, including top-level validation status and comments, 
-    and inserts it into the main and contact tables. (Mocking external API logic)
+    and inserts it into the main and contact tables. (External API logic)
     """
     data = request.get_json()
     conn = None
@@ -338,14 +378,21 @@ def submit_rfq_data():
     if not rfq_id:
         return jsonify({"status": "error", "message": "Missing required field: rfq_id"}), 400
 
-    # --- Extract Validation Data from the top level ---
-    final_status = data.pop('status', None) 
+    # --- 1. Extract and Normalize Validation Data ---
+    # The payload sends status as ['CONFIRMED'] (array), but the DB column is a single string.
+    final_status_array = data.pop('status', None) 
     final_validator_comments = data.pop('validator_comments', None)
+
+    # Normalize status from list to string (e.g., ['CONFIRMED'] -> 'CONFIRMED')
+    if isinstance(final_status_array, list) and final_status_array:
+        final_status = final_status_array[0]
+    else:
+        final_status = None # Or retrieve data.get('decision') if applicable, but better to keep it clean.
 
     try:
         conn, cursor = get_db()
         
-        # --- CONTACT HANDLING ---
+        # --- CONTACT HANDLING (Logic Unchanged) ---
         contact_data = data.get('contact', {})
         contact_email = contact_data.get('email')
         
@@ -354,7 +401,6 @@ def submit_rfq_data():
             return jsonify({"status": "error", "message": "Missing required contact field: email"}), 400
 
         contact_id_fk = None
-
         cursor.execute("SELECT contact_id FROM contact WHERE contact_email = %s", (contact_email,))
         existing_contact = cursor.fetchone()
 
@@ -365,26 +411,38 @@ def submit_rfq_data():
             cursor.execute(insert_contact_sql, (contact_data.get('role'), contact_data.get('email'), contact_data.get('phone')))
             contact_id_fk = cursor.fetchone()['contact_id']
 
-        # --- MAIN RFQ INSERTION ---
+        # --- 2. MAIN RFQ INSERTION (Using Explicit Columns) ---
 
-        # 2. Prepare main data fields
-        main_fields = {
-            'rfq_id': rfq_id, 'customer_name': data.get('customer_name'), 'application': data.get('application'), 'product_line': data.get('product_line'), 'customer_pn': data.get('customer_pn'), 'revision_level': data.get('revision_level'), 'delivery_zone': data.get('delivery_zone'), 'delivery_plant': data.get('delivery_plant'), 'sop_year': data.get('sop_year'), 'annual_volume': data.get('annual_volume'), 'rfq_reception_date': data.get('rfq_reception_date'), 'quotation_expected_date': data.get('quotation_expected_date'), 'target_price_eur': data.get('target_price_eur'), 'delivery_conditions': data.get('delivery_conditions'), 'payment_terms': data.get('payment_terms'), 'business_trigger': data.get('business_trigger'), 'entry_barriers': data.get('entry_barriers'), 'product_feasibility_note': data.get('product_feasibility_note'), 'manufacturing_location': data.get('manufacturing_location'), 'risks': data.get('risks'),
-            'decision': data.get('decision'), 'strategic_note': data.get('strategic_note'),
-            'design_responsibility': data.get('design_responsibility'), 'validation_responsibility': data.get('validation_responsibility'), 'design_ownership': data.get('design_ownership'), 'development_costs': data.get('development_costs'), 'technical_capacity': convert_to_boolean(data.get('technical_capacity', 'maybe')), 'scope_alignment': convert_to_boolean(data.get('scope_alignment', 'maybe')), 'overall_feasibility': data.get('overall_feasibility'), 'customer_status': data.get('customer_status'), 'final_recommendation': data.get('final_recommendation'),
-            # VALIDATOR FIELDS (New Columns)
-            'status': final_status, 
-            'validator_comments': final_validator_comments, 
-            
-            'contact_id_fk': contact_id_fk
-        }
+        # Define the exact order of columns for INSERT, ensuring all required fields are present
+        COLUMN_NAMES = [
+            'rfq_id', 'customer_name', 'application', 'product_line', 'customer_pn', 'revision_level',
+            'delivery_zone', 'delivery_plant', 'sop_year', 'annual_volume', 'rfq_reception_date',
+            'quotation_expected_date', 'target_price_eur', 'delivery_conditions', 'payment_terms',
+            'business_trigger', 'entry_barriers', 'product_feasibility_note', 'manufacturing_location',
+            'risks', 'decision', 'design_responsibility', 'validation_responsibility', 'design_ownership',
+            'development_costs', 'technical_capacity', 'scope_alignment', 'overall_feasibility',
+            'customer_status', 'strategic_note', 'final_recommendation', 'contact_id_fk', 
+            'validator_comments', 'status' # IMPORTANT: status is last due to its type change
+        ]
         
-        main_columns = ', '.join(main_fields.keys())
-        main_placeholders = ', '.join(['%s'] * len(main_fields))
-        main_values = list(main_fields.values())
+        # Build the list of values in the corresponding order
+        main_values = [
+            data.get('rfq_id'), data.get('customer_name'), data.get('application'), data.get('product_line'), data.get('customer_pn'), data.get('revision_level'),
+            data.get('delivery_zone'), data.get('delivery_plant'), data.get('sop_year'), data.get('annual_volume'), data.get('rfq_reception_date'),
+            data.get('quotation_expected_date'), data.get('target_price_eur'), data.get('delivery_conditions'), data.get('payment_terms'),
+            data.get('business_trigger'), data.get('entry_barriers'), data.get('product_feasibility_note'), data.get('manufacturing_location'),
+            data.get('risks'), data.get('decision'), data.get('design_responsibility'), data.get('validation_responsibility'), data.get('design_ownership'),
+            data.get('development_costs'), convert_to_boolean(data.get('technical_capacity')), convert_to_boolean(data.get('scope_alignment')), data.get('overall_feasibility'),
+            data.get('customer_status'), data.get('strategic_note'), data.get('final_recommendation'), contact_id_fk, 
+            final_validator_comments, final_status # Insert normalized validator data
+        ]
+        
+        columns_sql = ', '.join(COLUMN_NAMES)
+        placeholders_sql = ', '.join(['%s'] * len(COLUMN_NAMES))
 
-        insert_main_sql = f"INSERT INTO main ({main_columns}) VALUES ({main_placeholders})"
+        insert_main_sql = f"INSERT INTO main ({columns_sql}) VALUES ({placeholders_sql})"
         
+        # 3. Execute main insertion
         cursor.execute(insert_main_sql, main_values)
         conn.commit()
 
@@ -405,6 +463,7 @@ def submit_rfq_data():
     finally:
         if cursor: cursor.close()
         if conn: conn.close()
+
 
 
 @app.route('/api/rfq/get', methods=['GET'])
