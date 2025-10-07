@@ -24,10 +24,8 @@ DB_CONFIG = {
 app = Flask(__name__)
 
 # URL Configuration
-# When deploying to Azure, this BASE_URL should be changed to your public domain
-BASE_URL = "https://rfq-api.azurewebsites.net/" 
-RFQ_SUBMISSION_API_URL = "https://rfq-api.azurewebsites.net/api/rfq/submit" 
-# NOTE: The public API URL is hardcoded to Azure as requested.
+BASE_URL = "http://127.0.0.1:5000" 
+RFQ_SUBMISSION_API_URL = "http://127.0.0.1:5000/api/rfq/submit" 
 
 # Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED RELAY)
 app.config['MAIL_SERVER'] = 'avocarbon-com.mail.protection.outlook.com'
@@ -78,7 +76,7 @@ def get_request_data(request_id):
         result = cursor.fetchone()
         
         if result and 'data' in result:
-            return result['data']
+            return result['data'] # Data is returned as a dict by psycopg2 from JSONB
         return None
     except ConnectionError:
         return None 
@@ -95,13 +93,14 @@ def set_request_data(request_id, data):
     try:
         conn, cursor = get_db()
         
+        # Use ON CONFLICT DO UPDATE to handle both inserts (initial request) and updates (validation click)
         insert_sql = """
             INSERT INTO pending_validations (request_id, data, status)
             VALUES (%s, %s, %s)
             ON CONFLICT (request_id) DO UPDATE
             SET data = EXCLUDED.data, status = EXCLUDED.status, created_at = NOW();
         """
-        # Note: data is explicitly converted to JSON string for storage in JSONB column
+        # Store the Python dict 'data' by explicitly converting it to a JSON string for JSONB column
         cursor.execute(insert_sql, (request_id, json.dumps(data), data['status'])) 
         conn.commit()
     except Exception as e:
@@ -112,7 +111,7 @@ def set_request_data(request_id, data):
             conn.close()
 
 def delete_request_data(request_id):
-    """Deletes request data (optional, but good for cleanup)."""
+    """Deletes request data (optional, but good for cleanup once validated)."""
     conn = None
     try:
         conn, cursor = get_db()
