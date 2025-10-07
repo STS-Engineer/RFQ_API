@@ -409,11 +409,11 @@ def retrieve_products_modified():
 
 # --- APPLICATION CONFIGURATION ---
 # IMPORTANT: When deploying to Azure, change this to your deployed URL (e.g., https://rfq-api.azurewebsites.net)
-BASE_URL = "http://127.0.0.1:5000"
+BASE_URL = "https://rfq-api.azurewebsites.net"
 
 # --- External RFQ Submission API ---
 # This is the target endpoint for the final validated RFQ data
-RFQ_SUBMISSION_API_URL = "http://127.0.0.1:5000/api/rfq/submit"
+RFQ_SUBMISSION_API_URL = "https://rfq-api.azurewebsites.net/api/rfq/submit"
 
 # --- Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED RELAY) ---
 # NOTE: This configuration relies on your internal mail protection service allowing
