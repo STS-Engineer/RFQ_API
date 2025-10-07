@@ -24,8 +24,8 @@ DB_CONFIG = {
 app = Flask(__name__)
 
 # URL Configuration
-BASE_URL = "http://127.0.0.1:5000" 
-RFQ_SUBMISSION_API_URL = "http://127.0.0.1:5000/api/rfq/submit" 
+BASE_URL = "https://rfq-api.azurewebsites.net" 
+RFQ_SUBMISSION_API_URL = "https://rfq-api.azurewebsites.net/api/rfq/submit" 
 
 # Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED RELAY)
 app.config['MAIL_SERVER'] = 'avocarbon-com.mail.protection.outlook.com'
