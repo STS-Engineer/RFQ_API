@@ -504,16 +504,27 @@ def get_product_line_by_product_name():
         conn, cursor = get_db()
 
         # 2. Query to join products and product_lines tables
+        # Using only columns that actually exist in both tables
         query = """
             SELECT 
                 pl.id AS product_line_id,
                 pl.name AS product_line_name,
                 pl.type_of_products,
-                pl.description,
-                pl.market_segment,
+                pl.manufacturing_locations,
+                pl.design_center,
+                pl.product_line_manager,
+                pl.type_of_customers,
+                pl.metiers,
+                pl.strength,
+                pl.weakness,
+                pl.perspectives,
+                pl.history,
                 p.id AS product_id,
                 p.product_name,
-                p.description AS product_description
+                p.description AS product_description,
+                p.product_definition,
+                p.operating_environment,
+                p.technical_parameters
             FROM public.products p
             INNER JOIN public.product_lines pl 
                 ON p.product_line_id = pl.id
@@ -544,7 +555,16 @@ def get_product_line_by_product_name():
         return jsonify({
             "error": "Error retrieving product-line details from the database",
             "details": pg_error_message
-        }), 500  # Changed from 400 to 500
+        }), 500
+
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(error_details)
+        return jsonify({
+            "error": "An unexpected error occurred",
+            "details": str(e)
+        }), 500
 
     finally:
         if cursor:
