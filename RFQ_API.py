@@ -994,7 +994,7 @@ def get_product_line_by_product_name():
 #---------------------------------------------------------------------------------------------------------------
 
 # --- APPLICATION CONFIGURATION ---
-BASE_URL = "http://127.0.0.1:5000" # Base URL for validation links
+BASE_URL = "https://rfq-api.azurewebsites.net" # Base URL for validation links
 
 # --- Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED) ---
 # Assuming this configuration works for unauthenticated relay access.
