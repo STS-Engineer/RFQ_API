@@ -499,6 +499,7 @@ def get_product_line_by_product_name():
         }), 400
 
     conn = None
+    cursor = None
     try:
         conn, cursor = get_db()
 
@@ -543,9 +544,11 @@ def get_product_line_by_product_name():
         return jsonify({
             "error": "Error retrieving product-line details from the database",
             "details": pg_error_message
-        }), 400
+        }), 500  # Changed from 400 to 500
 
     finally:
+        if cursor:
+            cursor.close()
         if conn:
             conn.close()
 if __name__ == '__main__':
