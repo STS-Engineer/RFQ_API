@@ -151,10 +151,11 @@ def send_report_for_validation():
     user_email = data.get('user_email')
     validator_email = data.get('validator_email')
     rfq_payload = data.get('rfq_payload')
+    project_id = data.get('project_id')
 
-    if not all([report_content, user_email, validator_email, rfq_payload]):
+    if not all([report_content, user_email, validator_email, rfq_payload, project_id]): # MODIFIED: Added project_id check
         print("DEBUG: Missing required data.")
-        return jsonify({"message": "Missing required data (report, user_email, validator_email, rfq_payload)"}), 400
+        return jsonify({"message": "Missing required data (report, user_email, validator_email, rfq_payload, project_id)"}), 400 # MODIFIED: Error message
 
     # 2. Store State and Generate Token (Now uses PostgreSQL)
     request_id = str(uuid.uuid4())
@@ -162,7 +163,8 @@ def send_report_for_validation():
         'report_content': report_content,
         'user_email': user_email,
         'validator_email': validator_email,
-        'rfq_payload': rfq_payload, 
+        'rfq_payload': rfq_payload,
+        'project_id': project_id, 
         'status': 'PENDING',
         'validator_comments': None,
         'created_at': datetime.datetime.now().isoformat()
@@ -274,6 +276,85 @@ def validate_page():
     return html_content
 
 # --------------------------------------------------------------------------------------------------
+
+# --- MONDAY.COM INTEGRATION UTILITY ---
+
+# Placeholder for your actual Monday.com API URL
+MONDAY_API_URL = "https://api.monday.com/v2" 
+# WARNING: This token should be an environment variable, not hardcoded!
+MONDAY_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjU3MTg5ODk4NSwiYWFpIjoxMSwidWlkIjo3NjIxOTg5NSwiaWFkIjoiMjAyNS0xMC0wOVQwNzo1NToyMi4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.olEVa7_wuCFJaFuYU1Qp3A8JEuyq9vQihAdA2WVL6yA" 
+
+
+def update_monday_rfq_report(project_id, report_content):
+    """
+    Submits the validated report content to the specified Monday.com item.
+    FIXED: Ensures report_content is correctly JSON-escaped for the GraphQL mutation.
+    """
+    if not MONDAY_API_TOKEN or MONDAY_API_TOKEN == "YOUR_MONDAY_API_TOKEN":
+        print("FATAL: Monday API Token is not configured.")
+        return False, "Monday API Token not configured."
+        
+    item_id = project_id
+    board_id = "9550168457"  # Replace with your board ID
+    column_id = "long_text_mkwh4mee" # Replace with your target column ID
+
+   # 1. Prepare the column value in the structure Monday.com expects for Long Text
+    # It must be a JSON object with a 'text' key.
+    monday_column_object = {
+        "text": report_content
+    }
+
+    # 2. JSON-encode the entire object for safe transmission as the GraphQL 'value' argument
+    column_value_json = json.dumps(monday_column_object) 
+
+    # 3. Construct the GraphQL mutation.
+    # The 'value' argument is where we inject the double-encoded string.
+    mutation = f"""
+        mutation {{
+            change_column_value(
+                board_id: "{board_id}",  
+                item_id: "{item_id}",    
+                column_id: "{column_id}", 
+                value: {json.dumps(column_value_json)} 
+            ) {{
+                id
+            }}
+        }}
+    """
+    # NOTE: The outer json.dumps(column_value_json) ensures the inner JSON string 
+    # is safely embedded as a string literal within the GraphQL JSON payload.
+    
+    headers = {
+        "Authorization": MONDAY_API_TOKEN,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        print(f"DEBUG: Attempting to update Monday.com item {item_id} with report content...")
+        response = requests.post(
+            MONDAY_API_URL,
+            json={'query': mutation},
+            headers=headers
+        )
+        response.raise_for_status()
+        
+        response_data = response.json()
+        if 'errors' in response_data:
+            return False, f"GraphQL Error: {response_data['errors']}"
+            
+        print(f"DEBUG: Monday.com update successful for item {item_id}.")
+        return True, None
+        
+    except requests.exceptions.RequestException as e:
+        error_message = f"Monday.com API Request Failed: {e}"
+        print(f"FATAL MONDAY SUBMISSION ERROR: {error_message}")
+        return False, error_message
+    except Exception as e:
+        error_message = f"Unexpected Error during Monday update: {e}"
+        print(f"FATAL MONDAY SUBMISSION ERROR: {error_message}")
+        return False, error_message
+
+
 # --- 3. VALIDATION HANDLER ENDPOINT (Receives form data, updates state, and submits to DB) ---
 # --------------------------------------------------------------------------------------------------
 @app.route('/api/handle-validation', methods=['POST'])
@@ -311,7 +392,7 @@ def handle_validation():
         # Create the final payload by safely merging the original data with the new validation fields
         payload_to_send = {
             **original_rfq_payload,
-            "status": action.upper(),        # CRITICAL FIX: Array for PostgreSQL
+            "status": action.upper(),       
             "validator_comments": comments   
         }
         db_submission_status = "PENDING"
@@ -335,7 +416,26 @@ def handle_validation():
             db_submission_status = "FAILED"
             print(f"FATAL EXTERNAL SUBMISSION ERROR: {db_submission_error}")
 
-    # 4. Prepare and Send Final Email to the User
+     # 4. **NEW LOGIC: Update Monday.com if Confirmed**
+    monday_update_status = "SKIPPED"
+    monday_update_error = ""
+    
+    if action == 'confirm':
+        project_id = request_data.get('project_id') # Retrieve the stored project_id
+        report_content = request_data.get('report_content') # Retrieve the stored report content
+        
+        if project_id and report_content:
+            monday_ok, monday_err = update_monday_rfq_report(project_id, report_content)
+            if monday_ok:
+                monday_update_status = "SUCCESS"
+            else:
+                monday_update_status = "FAILED"
+                monday_update_error = monday_err
+        else:
+            monday_update_status = "FAILED"
+            monday_update_error = "Missing project_id or report_content in stored data."
+
+    # 5. Prepare and Send Final Email to the User (MODIFIED to include Monday status)
     user_email = request_data['user_email']
     color = '#4CAF50' if action == 'confirm' else '#F44336'
     subject = f"✅ Report {action.upper()} - Final Decision" if action == 'confirm' else f"❌ Report {action.upper()} - Final Decision"
@@ -344,19 +444,29 @@ def handle_validation():
     <html><body style="font-family: Arial, sans-serif; line-height: 1.6;"><h2>Your AI Report Validation Result</h2><p>The validator, <strong>{request_data['validator_email']}</strong>, has finished reviewing your report.</p><hr>
             <h3 style="color: {color};">Decision: {action.upper()}</h3><h4>Validator Comments:</h4><div style="border-left: 5px solid {color}; padding: 10px; background-color: #e9f5ff; border-radius: 0 4px 4px 0; margin-bottom: 20px;"><p style="margin: 0;">{comments}</p></div>
             <h4>Database Submission Status: <span style="color: {'#4CAF50' if db_submission_status == 'SUCCESS' else '#F44336'};">{db_submission_status}</span></h4>
-            {f'<p style="color: #F44336;">Error Details: {db_submission_error}</p>' if db_submission_status != 'SUCCESS' else ''}<p style="margin-top: 20px;">Thank you for using the AI Assistant.</p></body></html>
+            {f'<p style="color: #F44336;">External RFQ Error: {db_submission_error}</p>' if db_submission_status != 'SUCCESS' else ''}
+            
+            <h4>Monday.com Update Status (Confirmation Only): <span style="color: {'#4CAF50' if monday_update_status == 'SUCCESS' else ('#FFC107' if monday_update_status == 'SKIPPED' else '#F44336')};">{monday_update_status}</span></h4>
+            {f'<p style="color: #F44336;">Monday.com Error: {monday_update_error}</p>' if monday_update_status == 'FAILED' else ''}
+
+            <p style="margin-top: 20px;">Thank you for using the AI Assistant.</p></body></html>
     """
     msg = Message(subject, recipients=[user_email])
     msg.html = final_email_body_html
     safe_send_mail(msg) 
 
-    # 5. Show Success/Failure Page to Validator
-    if db_submission_status != 'SUCCESS':
+    # 6. Show Success/Failure Page to Validator (MODIFIED to include Monday status)
+    # The submission to the external RFQ API is the main failure point, so we check that first.
+    if db_submission_status != 'SUCCESS' or monday_update_status == 'FAILED':
+        overall_error_details = (f"External RFQ Submission Error: {db_submission_error}" if db_submission_status != 'SUCCESS' else "")
+        overall_error_details += (f"\nMonday.com Update Error: {monday_update_error}" if monday_update_status == 'FAILED' else "")
+        
         return f"""<!DOCTYPE html><html lang="en"><head><title>Submission Failed</title><style>body {{ font-family: 'Inter', sans-serif; text-align: center; padding: 50px; background-color: #fef2f2; }} .card {{ max-width: 720px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-left: 6px solid #dc2626; }} h1 {{ color: #dc2626; margin-bottom: 6px; }} pre {{ text-align: left; white-space: pre-wrap; background:#fff7ed; padding:12px; border-radius:6px; border:1px solid #fed7aa }}</style></head>
-        <body><div class="card"><h1>Decision Saved, Database Submission Failed</h1><p>Your validation decision was saved, but the final RFQ data could not be submitted to the external database API.</p><h3 style="margin-top:18px;">Error Details</h3><pre>{db_submission_error}</pre><p>The user was notified of this failure via email.</p></div></body></html>""", 500
+        <body><div class="card"><h1>Decision Saved, External Submission Failed</h1><p>Your validation decision was saved, but one or more external updates failed (RFQ API: {db_submission_status}, Monday: {monday_update_status}).</p><h3 style="margin-top:18px;">Error Details</h3><pre>{overall_error_details}</pre><p>The user was notified of this failure via email.</p></div></body></html>""", 500
 
+    # Successful completion page
     return f"""<!DOCTYPE html><html lang="en"><head><title>Success</title><style>body {{ font-family: 'Inter', sans-serif; text-align: center; padding: 50px; background-color: #f4f4f4; }} .card {{ max-width: 720px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-left: 6px solid {color}; }} h1 {{ color: {color}; }} p {{ color: #4b5563; }} .pill {{ display:inline-block; padding: 6px 10px; border-radius: 9999px; background:#ecfdf5; color:#065f46; font-weight:600; }}</style></head>
-    <body><div class="card"><h1>Validation Complete!</h1><p class="pill">Decision: {action.upper()}</p><p style="margin-top:14px;">Your decision has been recorded and the final RFQ data was successfully submitted to the database.</p><p style="margin-top:18px;"><a href="/" style="color:#2563eb; text-decoration:none;">Return to start</a></p></div></body></html>"""
+    <body><div class="card"><h1>Validation Complete!</h1><p class="pill">Decision: {action.upper()}</p><p style="margin-top:14px;">Your decision has been recorded, the final RFQ data was successfully submitted to the database, and the Monday.com board was updated (Status: {monday_update_status}).</p><p style="margin-top:18px;"><a href="/" style="color:#2563eb; text-decoration:none;">Return to start</a></p></div></body></html>"""
 
 
 # --- 3. API ENDPOINTS (Submission and Retrieval Endpoints) ---
