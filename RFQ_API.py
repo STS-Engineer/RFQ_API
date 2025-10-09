@@ -1,11 +1,22 @@
 import os
 import base64
+import time
+from typing import List, Dict, Any, Optional
+
 import psycopg2
 from psycopg2 import OperationalError, errorcodes, extras
+import requests
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from pydantic import BaseModel, Field, ValidationError
+
+# ------------------------ .env setup ------------------------
+load_dotenv()
+ENV_API_KEY = os.getenv("APOLLO_API_KEY")
+ALLOW_HEADER_OVERRIDE = os.getenv("ALLOW_HEADER_OVERRIDE", "false").lower() in ("1", "true", "yes")
 
 # --- 1. CONFIGURATION ---
-# IMPORTANT: Replace these placeholders with your actual PostgreSQL credentials.
+# PostgreSQL configuration
 DB_CONFIG = {
     "host": "avo-adb-002.postgres.database.azure.com",
     "database": "RFQ_DATA",
@@ -15,24 +26,101 @@ DB_CONFIG = {
 
 app = Flask(__name__)
 
-# --- 2. DATABASE CONNECTION UTILITY ---
+# ------------------------ Pydantic Models ------------------------
+class SearchPeopleRequest(BaseModel):
+    q_organization_name: List[str] = Field(..., description="List of company names to search")
+    person_titles: Optional[List[str]] = Field(None, description="Array of job titles to filter by")
+    person_seniorities: Optional[List[str]] = Field(None, description="Filter by seniority levels")
+    organization_num_employees_ranges: Optional[List[str]] = Field(None, description="Filter by company size")
+    q_organization_domains: Optional[List[str]] = Field(None, description="Filter by company domain")
+    page: int = Field(1, ge=1, le=500, description="Page number for pagination")
+    per_page: int = Field(25, ge=1, le=100, description="Number of results per page per organization")
+    delay_between_requests: float = Field(1.0, ge=0, description="Delay in seconds between API calls")
 
+class EnrichPersonRequest(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    name: Optional[str] = None
+    organization_name: Optional[str] = None
+    domain: Optional[str] = None
+    email: Optional[str] = None
+    id: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    reveal_personal_emails: bool = False
+    reveal_phone_number: bool = False
+    webhook_url: Optional[str] = None
+
+class BulkEnrichRequest(BaseModel):
+    details: List[Dict[str, Any]] = Field(..., max_items=10)
+    reveal_personal_emails: bool = False
+    reveal_phone_number: bool = False
+    webhook_url: Optional[str] = None
+
+# ------------------------ Apollo Client ------------------------
+class ApolloClient:
+    """Client for Apollo.io API"""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.apollo.io/api/v1"
+        self.headers = {
+            "X-Api-Key": api_key,
+            "Content-Type": "application/json"
+        }
+
+    def search_single_organization(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/mixed_people/search",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def enrich_person(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/people/match",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def bulk_enrich(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/people/bulk_match",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
+# ------------------------ Helpers ------------------------
+def get_apollo_client(api_key: Optional[str] = None) -> ApolloClient:
+    """
+    Use provided key if ALLOW_HEADER_OVERRIDE=true, otherwise use .env key.
+    """
+    if ALLOW_HEADER_OVERRIDE and api_key:
+        return ApolloClient(api_key)
+    if not ENV_API_KEY:
+        raise RuntimeError("APOLLO_API_KEY is not set. Add it to your .env or environment variables.")
+    return ApolloClient(ENV_API_KEY)
+
+# --- 2. DATABASE CONNECTION UTILITY ---
 def get_db():
     """Returns a PostgreSQL database connection and a RealDictCursor."""
     conn = None
     try:
-        # Establish connection using the configuration dictionary
         conn = psycopg2.connect(**DB_CONFIG)
-        # Set the row factory to return dictionaries
         cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
         return conn, cursor
     except OperationalError as e:
-        # Log the specific connection failure
         print(f"PostgreSQL connection failed: {e}")
-        # Re-raise the error to be handled by the API endpoint caller
         if conn:
             conn.close()
-        # Use str(e) as a fallback if e.pgerror is not available (common in connection errors)
         error_message = f"Database connection failed: {str(e)}"
         raise ConnectionError(error_message)
     except Exception as e:
@@ -40,19 +128,213 @@ def get_db():
             conn.close()
         raise e
 
-
 def convert_to_boolean(value):
     """Safely converts string/bool input to a Python boolean."""
     if isinstance(value, bool):
-        return value # Handles true/false from JSON
+        return value
     if isinstance(value, str):
-        # Handles "yes"/"true" strings
         return value.lower() in ['yes', 'true']
-    # Default behavior for missing/unexpected values (e.g., None, 'maybe')
-    return False 
+    return False
 
-# --- 3. API ENDPOINTS ---
+# ------------------------ Apollo Routes ------------------------
+@app.route('/')
+def root():
+    return {
+        "status": "online",
+        "service": "Merged RFQ & Apollo.io API",
+        "version": "1.0.0",
+        "endpoints": {
+            "rfq_submit": "/api/rfq/submit",
+            "rfq_get": "/api/rfq/get",
+            "products": "/api/products",
+            "product_lines": "/api/product-lines",
+            "product_lines_list": "/api/product-lines/list",
+            "product_lines_details": "/api/product-lines/details",
+            "apollo_search": "/apollo/search",
+            "apollo_enrich": "/apollo/enrich",
+            "apollo_bulk_enrich": "/apollo/bulk_enrich"
+        }
+    }
 
+@app.route('/health')
+def health():
+    return {"status": "healthy"}
+
+@app.route('/apollo/search', methods=['POST'])
+@app.route('/api/v1/mixed_people/search', methods=['POST'])
+def search_people_simple():
+    """
+    Search for people across multiple organizations.
+    Loops through each organization and aggregates results.
+    """
+    data = request.get_json()
+    x_api_key = request.headers.get('X-Api-Key')
+    
+    try:
+        req = SearchPeopleRequest(**data)
+    except ValidationError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    try:
+        client = get_apollo_client(x_api_key)
+    except RuntimeError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    all_contacts: List[Dict[str, Any]] = []
+    total_entries = 0
+    organizations_searched: List[str] = []
+    errors: List[Dict[str, str]] = []
+
+    for idx, org_name in enumerate(req.q_organization_name):
+        try:
+            payload: Dict[str, Any] = {
+                "q_organization_name": org_name,
+                "page": req.page,
+                "per_page": req.per_page
+            }
+            if req.person_titles:
+                payload["person_titles"] = req.person_titles
+            if req.person_seniorities:
+                payload["person_seniorities"] = req.person_seniorities
+            if req.organization_num_employees_ranges:
+                payload["organization_num_employees_ranges"] = req.organization_num_employees_ranges
+            if req.q_organization_domains:
+                payload["q_organization_domains"] = req.q_organization_domains
+
+            data = client.search_single_organization(payload)
+
+            contacts = data.get("contacts", []) or data.get("people", [])
+            all_contacts.extend(contacts)
+
+            pagination = data.get("pagination", {})
+            total_entries += pagination.get("total_entries", 0)
+            organizations_searched.append(org_name)
+
+            print(f"✓ Found {len(contacts)} contacts from {org_name}")
+
+            if idx < len(req.q_organization_name) - 1:
+                time.sleep(req.delay_between_requests)
+
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", "unknown")
+            errors.append({"organization": org_name, "error": f"HTTP error searching {org_name}: {status}"})
+            print(f"✗ HTTP error searching {org_name}: {status}")
+        except Exception as e:
+            errors.append({"organization": org_name, "error": f"Error searching {org_name}: {str(e)}"})
+            print(f"✗ Error searching {org_name}: {str(e)}")
+
+    response: Dict[str, Any] = {
+        "organizations_searched": organizations_searched,
+        "total_organizations": len(req.q_organization_name),
+        "successful_searches": len(organizations_searched),
+        "failed_searches": len(errors),
+        "total_contacts": len(all_contacts),
+        "contacts": all_contacts,
+        "pagination": {
+            "page": req.page,
+            "per_page": req.per_page,
+            "total_entries": total_entries
+        }
+    }
+    if errors:
+        response["errors"] = errors
+    
+    return jsonify(response), 200
+
+@app.route('/apollo/enrich', methods=['POST'])
+@app.route('/api/v1/people/match', methods=['POST'])
+def enrich_person():
+    data = request.get_json()
+    x_api_key = request.headers.get('X-Api-Key')
+    
+    try:
+        req = EnrichPersonRequest(**data)
+    except ValidationError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    # Validation
+    if req.reveal_phone_number and not req.webhook_url:
+        return jsonify({
+            "status": "error",
+            "message": "webhook_url is mandatory when reveal_phone_number is True"
+        }), 400
+
+    payload: Dict[str, Any] = {}
+    if req.name:
+        payload["name"] = req.name
+    else:
+        if req.first_name:
+            payload["first_name"] = req.first_name
+        if req.last_name:
+            payload["last_name"] = req.last_name
+
+    if req.organization_name:
+        payload["organization_name"] = req.organization_name
+    if req.domain:
+        payload["domain"] = req.domain
+    if req.email:
+        payload["email"] = req.email
+    if req.id:
+        payload["id"] = req.id
+    if req.linkedin_url:
+        payload["linkedin_url"] = req.linkedin_url
+    if req.reveal_personal_emails:
+        payload["reveal_personal_emails"] = True
+    if req.reveal_phone_number:
+        payload["reveal_phone_number"] = True
+        payload["webhook_url"] = req.webhook_url
+
+    try:
+        client = get_apollo_client(x_api_key)
+        data = client.enrich_person(payload)
+        return jsonify(data), 200
+    except RuntimeError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    except requests.exceptions.HTTPError as e:
+        status = getattr(e.response, "status_code", 500)
+        text = getattr(e.response, "text", str(e))
+        return jsonify({"status": "error", "message": text}), status
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/apollo/bulk_enrich', methods=['POST'])
+@app.route('/api/v1/people/bulk_match', methods=['POST'])
+def bulk_enrich_people():
+    data = request.get_json()
+    x_api_key = request.headers.get('X-Api-Key')
+    
+    try:
+        req = BulkEnrichRequest(**data)
+    except ValidationError as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+    if req.reveal_phone_number and not req.webhook_url:
+        return jsonify({
+            "status": "error",
+            "message": "webhook_url is mandatory when reveal_phone_number is True"
+        }), 400
+
+    payload: Dict[str, Any] = {"details": req.details}
+    if req.reveal_personal_emails:
+        payload["reveal_personal_emails"] = True
+    if req.reveal_phone_number:
+        payload["reveal_phone_number"] = True
+        payload["webhook_url"] = req.webhook_url
+
+    try:
+        client = get_apollo_client(x_api_key)
+        data = client.bulk_enrich(payload)
+        return jsonify(data), 200
+    except RuntimeError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    except requests.exceptions.HTTPError as e:
+        status = getattr(e.response, "status_code", 500)
+        text = getattr(e.response, "text", str(e))
+        return jsonify({"status": "error", "message": text}), status
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# --- 3. RFQ API ENDPOINTS ---
 @app.route('/api/rfq/submit', methods=['POST'])
 def submit_rfq_data():
     """Receives structured RFQ data and inserts it into the main and contact tables."""
@@ -68,12 +350,8 @@ def submit_rfq_data():
         return jsonify({"status": "error", "message": "Missing required field: rfq_id"}), 400
 
     try:
-        # 1. Establish connection
         conn, cursor = get_db()
         
-        # Start transaction block
-        
-        # --- CONTACT HANDLING (1:N Relationship) ---
         contact_data = data.get('contact', {})
         contact_email = contact_data.get('email')
         
@@ -83,7 +361,6 @@ def submit_rfq_data():
 
         contact_id_fk = None
 
-        # A. Try to find existing contact by email
         cursor.execute(
             "SELECT contact_id FROM contact WHERE contact_email = %s", 
             (contact_email,)
@@ -91,10 +368,8 @@ def submit_rfq_data():
         existing_contact = cursor.fetchone()
 
         if existing_contact:
-            # Contact found, use existing ID
             contact_id_fk = existing_contact['contact_id']
         else:
-            # B. Contact not found, insert new contact and retrieve its new ID
             insert_contact_sql = """
             INSERT INTO contact (contact_role, contact_email, contact_phone)
             VALUES (%s, %s, %s)
@@ -108,13 +383,8 @@ def submit_rfq_data():
                     contact_data.get('phone')
                 )
             )
-            # Fetch the ID generated by SERIAL
             contact_id_fk = cursor.fetchone()['contact_id']
 
-        # --- MAIN RFQ INSERTION ---
-
-        # 2. Prepare main data fields
-        # Note: Psycopg2 handles Python's True/False correctly for PostgreSQL BOOLEAN.
         main_fields = {
             'rfq_id': rfq_id,
             'customer_name': data.get('customer_name'),
@@ -147,7 +417,7 @@ def submit_rfq_data():
             'customer_status': data.get('customer_status'),
             'strategic_note': data.get('strategic_note'),
             'final_recommendation': data.get('final_recommendation'),
-            'contact_id_fk': contact_id_fk # The ID determined above
+            'contact_id_fk': contact_id_fk
         }
         
         main_columns = ', '.join(main_fields.keys())
@@ -159,10 +429,7 @@ def submit_rfq_data():
         VALUES ({main_placeholders})
         """
         
-        # 3. Execute main insertion
         cursor.execute(insert_main_sql, main_values)
-        
-        # 4. Commit the transaction if successful
         conn.commit()
 
         return jsonify({
@@ -172,14 +439,12 @@ def submit_rfq_data():
         }), 200
 
     except ConnectionError as e:
-        # Handled in get_db for connection issues
         return jsonify({"status": "error", "message": str(e)}), 500
 
     except OperationalError as e:
         if conn:
             conn.rollback()
             
-        # Safely extract PostgreSQL error details
         pg_error_message = getattr(e, 'pgerror', None)
         detail_message = pg_error_message.strip() if pg_error_message else str(e)
 
@@ -201,54 +466,38 @@ def submit_rfq_data():
         if conn:
             conn.close()
 
-
-
-
 @app.route('/api/rfq/get', methods=['GET'])
 def get_rfq_data():
     """Retrieves RFQ data based on dynamic query parameters (rfq_id, customer_name, product_line)."""
     
-    # Get all query parameters
     rfq_id = request.args.get('rfq_id')
     customer_name = request.args.get('customer_name')
     product_line = request.args.get('product_line')
     
-    # List to hold WHERE clause fragments and their corresponding values
     where_clauses = []
     query_params = []
     
-    # --- 1. Dynamic WHERE Clause Construction ---
-    
     if rfq_id:
-        # Use exact match for RFQ ID
         where_clauses.append("m.rfq_id = %s")
         query_params.append(rfq_id)
 
     if customer_name:
-        # Use case-insensitive partial match for Customer Name
         where_clauses.append("m.customer_name ILIKE %s")
-        query_params.append(f"%{customer_name}%") # Add wildcards for LIKE/ILIKE
+        query_params.append(f"%{customer_name}%")
 
     if product_line:
-        # Use exact match for Product Line
         where_clauses.append("m.product_line = %s")
         query_params.append(product_line)
 
-    # Check if any filter was provided
     if not where_clauses:
         return jsonify({"status": "error", "message": "At least one search parameter (rfq_id, customer_name, or product_line) is required."}), 400
 
-    # Combine clauses with 'AND'
     where_sql = " AND ".join(where_clauses)
-    
-    # --- 2. SQL Query Execution ---
     
     conn = None
     try:
         conn, cursor = get_db()
         
-        # SQL to join main and contact tables and filter results
-        # Alias 'm' for main and 'c' for contact
         select_sql = f"""
         SELECT 
             m.*, 
@@ -276,25 +525,18 @@ def get_rfq_data():
                 "data": []
             }), 200
 
-        # --- 3. Formatting Results (Optional, but recommended for clean API output) ---
-        
-        # Reformat the flat result rows into the original nested structure (main + nested contact)
         formatted_results = []
         for row in results:
-            # Create a dictionary for the main RFQ data
             rfq_data = dict(row)
             
-            # Extract contact fields and put them into a 'contact' dictionary
             contact = {
                 'role': rfq_data.pop('contact_role', None),
                 'email': rfq_data.pop('contact_email', None),
                 'phone': rfq_data.pop('contact_phone', None)
             }
-            # Remove the foreign key from the main object
             rfq_data.pop('contact_id_fk', None) 
-            rfq_data.pop('contact_id', None) # Remove if joined table also returns its primary key
+            rfq_data.pop('contact_id', None)
             
-            # Add the nested contact object back
             rfq_data['contact'] = contact
             formatted_results.append(rfq_data)
 
@@ -308,7 +550,6 @@ def get_rfq_data():
         return jsonify({"status": "error", "message": str(e)}), 500
 
     except OperationalError as e:
-        # Log and rollback, though rollback isn't strictly necessary for a SELECT
         print(f"PostgreSQL query failed: {e}")
         return jsonify({
             "status": "error",
@@ -323,7 +564,6 @@ def get_rfq_data():
         if conn:
             conn.close()
 
-
 @app.route('/api/products', methods=['GET'])
 def retrieve_products_modified():
     """
@@ -335,7 +575,6 @@ def retrieve_products_modified():
     try:
         conn, cursor = get_db()
         
-        # --- NEW EXPLICIT SELECT QUERY ---
         select_columns = """
             id, product_name, product_line, description, product_definition, 
             operating_environment, technical_parameters, machines_and_tooling, 
@@ -350,19 +589,14 @@ def retrieve_products_modified():
         search_pattern = None
         
         if product_name:
-            # Filter by partial name match
             query += " WHERE product_name ILIKE %s"
             search_pattern = f"%{product_name}%"
             cursor.execute(query, (search_pattern,))
         else:
-            # Get all products
             cursor.execute(query) 
 
         products_data = cursor.fetchall()
-        
-        # No need for base64 conversion here! ðŸŽ‰
 
-        # 2. Format and Send Response (200 OK)
         return jsonify({
             "query": product_name if product_name else "All Products",
             "products": products_data, 
@@ -383,18 +617,13 @@ def retrieve_products_modified():
         if conn:
             conn.close()
 
-# ----------------------------------------------------------------------
-
 @app.route('/api/product-lines', methods=['GET'])
 def retrieve_product_line_modified():
     """
     Retrieves product line data from the 'product_lines' table using a required ID.
-    (Used to identify {Product_Line} automatically after product selection in Step 1)
     """
-    # Changed parameter name to reflect the required foreign key
     product_line_id = request.args.get('productLineId') 
 
-    # 1. Parameter Validation (Required: productLineId)
     if not product_line_id:
         return jsonify({
             "error": "Missing required query parameter: productLineId",
@@ -405,7 +634,6 @@ def retrieve_product_line_modified():
     try:
         conn, cursor = get_db()
 
-        # 2. SQL Query: Exact match on the 'id' column
         query = """
             SELECT *
             FROM public.product_lines
@@ -415,7 +643,6 @@ def retrieve_product_line_modified():
 
         product_line_data = cursor.fetchall()
 
-        # 3. Format and Send Response (200 OK)
         return jsonify({
             "query": product_line_id,
             "productLine": product_line_data, 
@@ -436,21 +663,15 @@ def retrieve_product_line_modified():
         if conn:
             conn.close()
 
-
 @app.route('/api/product-lines/list', methods=['GET'])
 def list_product_lines():
     """
     Retrieves the list of all product lines (ID and Name) for selection menus.
-    This API does NOT require any parameters.
     """
     conn = None
     try:
-        # Assurez-vous d'avoir une fonction get_db() qui retourne la connexion et le curseur
-        # Make sure you have a working get_db() function returning connection and cursor
         conn, cursor = get_db()
 
-        # 1. RequÃªte SQL pour obtenir uniquement les ID et les noms (ou texte)
-        # SQL query to get only the ID and Name (or text)
         query = """
             SELECT id, name AS product_line_name, type_of_products AS description_snippet
             FROM public.product_lines
@@ -460,8 +681,6 @@ def list_product_lines():
 
         product_lines_list = cursor.fetchall()
 
-        # 2. Format et Envoi de la RÃ©ponse (200 OK)
-        # Format and Send Response (200 OK)
         return jsonify({
             "productLinesList": product_lines_list,
             "count": len(product_lines_list),
@@ -486,12 +705,9 @@ def list_product_lines():
 def get_product_line_by_product_name():
     """
     Retrieves product line details based on a given product name.
-    Useful when the client app only knows the product name and 
-    needs to find the related product line info.
     """
     product_name = request.args.get('productName')
 
-    # 1. Validate parameter
     if not product_name:
         return jsonify({
             "error": "Missing required query parameter: productName",
@@ -503,8 +719,6 @@ def get_product_line_by_product_name():
     try:
         conn, cursor = get_db()
 
-        # 2. Query to join products and product_lines tables
-        # Using only columns that actually exist in both tables
         query = """
             SELECT 
                 pl.id AS product_line_id,
@@ -571,7 +785,6 @@ def get_product_line_by_product_name():
             cursor.close()
         if conn:
             conn.close()
+
 if __name__ == '__main__':
-    # When running locally, set the FLASK_APP environment variable.
-    # On Azure, gunicorn will handle execution.
     app.run(debug=True)
