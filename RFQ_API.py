@@ -1,8 +1,21 @@
 import os
 import base64
+import time
+from typing import List, Dict, Any, Optional, Tuple
 import psycopg2
 from psycopg2 import OperationalError, errorcodes, extras
 from flask import Flask, request, jsonify
+import requests
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, ValidationError
+
+# --- APOLLO API SETUP ---
+load_dotenv()
+ENV_API_KEY = os.getenv("APOLLO_API_KEY")
+ALLOW_HEADER_OVERRIDE = os.getenv("ALLOW_HEADER_OVERRIDE", "false").lower() in ("1", "true", "yes")
+
+if not ENV_API_KEY:
+    raise RuntimeError("APOLLO_API_KEY is not set. Add it to your .env or environment variables.")
 
 # --- 1. CONFIGURATION ---
 # IMPORTANT: Replace these placeholders with your actual PostgreSQL credentials.
@@ -14,6 +27,36 @@ DB_CONFIG = {
 }
 
 app = Flask(__name__)
+
+# --- APOLLO PYDANTIC MODELS ---
+class SearchPeopleRequest(BaseModel):
+    q_organization_name: List[str] = Field(..., description="List of company names to search")
+    person_titles: Optional[List[str]] = Field(None, description="Array of job titles to filter by")
+    person_seniorities: Optional[List[str]] = Field(None, description="Filter by seniority levels")
+    organization_num_employees_ranges: Optional[List[str]] = Field(None, description="Filter by company size")
+    q_organization_domains: Optional[List[str]] = Field(None, description="Filter by company domain")
+    page: int = Field(1, ge=1, le=500, description="Page number for pagination")
+    per_page: int = Field(25, ge=1, le=100, description="Number of results per page per organization")
+    delay_between_requests: float = Field(1.0, ge=0, description="Delay in seconds between API calls")
+
+class EnrichPersonRequest(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    name: Optional[str] = None
+    organization_name: Optional[str] = None
+    domain: Optional[str] = None
+    email: Optional[str] = None
+    id: Optional[str] = None
+    linkedin_url: Optional[str] = None
+    reveal_personal_emails: bool = False
+    reveal_phone_number: bool = False
+    webhook_url: Optional[str] = None
+
+class BulkEnrichRequest(BaseModel):
+    details: List[Dict[str, Any]] = Field(..., max_items=10)
+    reveal_personal_emails: bool = False
+    reveal_phone_number: bool = False
+    webhook_url: Optional[str] = None
 
 # --- 2. DATABASE CONNECTION UTILITY ---
 
@@ -51,7 +94,263 @@ def convert_to_boolean(value):
     # Default behavior for missing/unexpected values (e.g., None, 'maybe')
     return False 
 
+# --- APOLLO CLIENT CLASS ---
+class ApolloClient:
+    """Client for Apollo.io API"""
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.apollo.io/api/v1"
+        self.headers = {
+            "X-Api-Key": api_key,
+            "Content-Type": "application/json"
+        }
+
+    def search_single_organization(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/mixed_people/search",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def enrich_person(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/people/match",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def bulk_enrich(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        response = requests.post(
+            f"{self.base_url}/people/bulk_match",
+            headers=self.headers,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        return response.json()
+
+# --- APOLLO HELPERS ---
+def get_apollo_client_from_request(req) -> ApolloClient:
+    """
+    Use header key only if ALLOW_HEADER_OVERRIDE=true and header provided.
+    Otherwise, use the .env key.
+    """
+    header_key = req.headers.get("X-Api-Key")
+    if ALLOW_HEADER_OVERRIDE and header_key:
+        return ApolloClient(header_key)
+    return ApolloClient(ENV_API_KEY)
+
+def parse_body(model_cls) -> Tuple[Optional[BaseModel], Optional[Dict[str, Any]]]:
+    """
+    Parse and validate JSON body with Pydantic. Returns (model_instance, error_json).
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        obj = model_cls(**payload)
+        return obj, None
+    except ValidationError as ve:
+        return None, {"detail": ve.errors()}
+    except Exception as e:
+        return None, {"detail": str(e)}
+
 # --- 3. API ENDPOINTS ---
+
+# Root endpoint
+@app.get("/")
+def root():
+    return jsonify({
+        "status": "online",
+        "service": "RFQ API with Apollo.io Integration",
+        "version": "1.0.0",
+        "endpoints": {
+            "rfq": {
+                "submit": "/api/rfq/submit",
+                "get": "/api/rfq/get"
+            },
+            "products": {
+                "list": "/api/products",
+                "lines": "/api/product-lines",
+                "lines_list": "/api/product-lines/list",
+                "lines_details": "/api/product-lines/details"
+            },
+            "apollo": {
+                "search": "/apollo/search",
+                "enrich": "/apollo/enrich",
+                "bulk_enrich": "/apollo/bulk_enrich"
+            }
+        }
+    })
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "healthy"})
+
+# --- APOLLO ENDPOINTS ---
+
+@app.post("/apollo/search")
+def search_people_simple():
+    """
+    Search for people across multiple organizations.
+    Loops through each organization and aggregates results.
+    """
+    req, err = parse_body(SearchPeopleRequest)
+    if err:
+        return jsonify(err), 422
+
+    client = get_apollo_client_from_request(request)
+
+    all_contacts: List[Dict[str, Any]] = []
+    total_entries = 0
+    organizations_searched: List[str] = []
+    errors: List[Dict[str, str]] = []
+
+    for idx, org_name in enumerate(req.q_organization_name):
+        try:
+            payload: Dict[str, Any] = {
+                "q_organization_name": org_name,
+                "page": req.page,
+                "per_page": req.per_page
+            }
+            if req.person_titles:
+                payload["person_titles"] = req.person_titles
+            if req.person_seniorities:
+                payload["person_seniorities"] = req.person_seniorities
+            if req.organization_num_employees_ranges:
+                payload["organization_num_employees_ranges"] = req.organization_num_employees_ranges
+            if req.q_organization_domains:
+                payload["q_organization_domains"] = req.q_organization_domains
+
+            data = client.search_single_organization(payload)
+
+            contacts = data.get("contacts", []) or data.get("people", [])
+            all_contacts.extend(contacts)
+
+            pagination = data.get("pagination", {})
+            total_entries += pagination.get("total_entries", 0)
+            organizations_searched.append(org_name)
+
+            print(f"✓ Found {len(contacts)} contacts from {org_name}")
+
+            if idx < len(req.q_organization_name) - 1:
+                time.sleep(req.delay_between_requests)
+
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", "unknown")
+            errors.append({"organization": org_name, "error": f"HTTP error searching {org_name}: {status}"})
+            print(f"✗ HTTP error searching {org_name}: {status}")
+        except Exception as e:
+            errors.append({"organization": org_name, "error": f"Error searching {org_name}: {str(e)}"})
+            print(f"✗ Error searching {org_name}: {str(e)}")
+
+    response: Dict[str, Any] = {
+        "organizations_searched": organizations_searched,
+        "total_organizations": len(req.q_organization_name),
+        "successful_searches": len(organizations_searched),
+        "failed_searches": len(errors),
+        "total_contacts": len(all_contacts),
+        "contacts": all_contacts,
+        "pagination": {
+            "page": req.page,
+            "per_page": req.per_page,
+            "total_entries": total_entries
+        }
+    }
+    if errors:
+        response["errors"] = errors
+    return jsonify(response), (207 if errors else 200)
+
+# Mirror FastAPI alias
+@app.post("/api/v1/mixed_people/search")
+def search_people_alias():
+    return search_people_simple()
+
+@app.post("/apollo/enrich")
+@app.post("/api/v1/people/match")
+def enrich_person():
+    req, err = parse_body(EnrichPersonRequest)
+    if err:
+        return jsonify(err), 422
+
+    # Validation parity with FastAPI version
+    if req.reveal_phone_number and not req.webhook_url:
+        return jsonify({
+            "detail": "webhook_url is mandatory when reveal_phone_number is True"
+        }), 400
+
+    payload: Dict[str, Any] = {}
+    if req.name:
+        payload["name"] = req.name
+    else:
+        if req.first_name:
+            payload["first_name"] = req.first_name
+        if req.last_name:
+            payload["last_name"] = req.last_name
+
+    if req.organization_name:
+        payload["organization_name"] = req.organization_name
+    if req.domain:
+        payload["domain"] = req.domain
+    if req.email:
+        payload["email"] = req.email
+    if req.id:
+        payload["id"] = req.id
+    if req.linkedin_url:
+        payload["linkedin_url"] = req.linkedin_url
+    if req.reveal_personal_emails:
+        payload["reveal_personal_emails"] = True
+    if req.reveal_phone_number:
+        payload["reveal_phone_number"] = True
+        payload["webhook_url"] = req.webhook_url
+
+    client = get_apollo_client_from_request(request)
+    try:
+        data = client.enrich_person(payload)
+        return jsonify(data)
+    except requests.exceptions.HTTPError as e:
+        status = getattr(e.response, "status_code", 500)
+        text = getattr(e.response, "text", str(e))
+        return jsonify({"detail": text}), status
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+@app.post("/apollo/bulk_enrich")
+@app.post("/api/v1/people/bulk_match")
+def bulk_enrich_people():
+    req, err = parse_body(BulkEnrichRequest)
+    if err:
+        return jsonify(err), 422
+
+    if req.reveal_phone_number and not req.webhook_url:
+        return jsonify({
+            "detail": "webhook_url is mandatory when reveal_phone_number is True"
+        }), 400
+
+    payload: Dict[str, Any] = {"details": req.details}
+    if req.reveal_personal_emails:
+        payload["reveal_personal_emails"] = True
+    if req.reveal_phone_number:
+        payload["reveal_phone_number"] = True
+        payload["webhook_url"] = req.webhook_url
+
+    client = get_apollo_client_from_request(request)
+    try:
+        data = client.bulk_enrich(payload)
+        return jsonify(data)
+    except requests.exceptions.HTTPError as e:
+        status = getattr(e.response, "status_code", 500)
+        text = getattr(e.response, "text", str(e))
+        return jsonify({"detail": text}), status
+    except Exception as e:
+        return jsonify({"detail": str(e)}), 500
+
+# --- RFQ ENDPOINTS ---
 
 @app.route('/api/rfq/submit', methods=['POST'])
 def submit_rfq_data():
@@ -449,7 +748,7 @@ def list_product_lines():
         # Make sure you have a working get_db() function returning connection and cursor
         conn, cursor = get_db()
 
-        # 1. Requête SQL pour obtenir uniquement les ID et les noms (ou texte)
+        # 1. RequÃªte SQL pour obtenir uniquement les ID et les noms (ou texte)
         # SQL query to get only the ID and Name (or text)
         query = """
             SELECT id, name AS product_line_name, type_of_products AS description_snippet
@@ -460,7 +759,7 @@ def list_product_lines():
 
         product_lines_list = cursor.fetchall()
 
-        # 2. Format et Envoi de la Réponse (200 OK)
+        # 2. Format et Envoi de la RÃ©ponse (200 OK)
         # Format and Send Response (200 OK)
         return jsonify({
             "productLinesList": product_lines_list,
@@ -571,6 +870,7 @@ def get_product_line_by_product_name():
             cursor.close()
         if conn:
             conn.close()
+
 if __name__ == '__main__':
     # When running locally, set the FLASK_APP environment variable.
     # On Azure, gunicorn will handle execution.
