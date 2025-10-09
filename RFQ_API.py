@@ -8,8 +8,9 @@ import requests
 from flask import Flask, request, jsonify
 
 # ------------------------ Environment Variables ------------------------
-ENV_API_KEY = os.environ.get("APOLLO_API_KEY")
-ALLOW_HEADER_OVERRIDE = os.environ.get("ALLOW_HEADER_OVERRIDE", "false").lower() in ("1", "true", "yes")
+# Apollo API Key - hardcoded for simplicity
+ENV_API_KEY = "WsqN_6KDO9kkRBt1ZvkDDw"
+ALLOW_HEADER_OVERRIDE = os.environ.get("ALLOW_HEADER_OVERRIDE", "true").lower() in ("1", "true", "yes")
 
 # --- 1. CONFIGURATION ---
 # PostgreSQL configuration
