@@ -42,7 +42,8 @@ mail = Mail(app)
 
 # Monday.com Configuration
 MONDAY_API_URL = "https://api.monday.com/v2" 
-MONDAY_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjU3MTg5ODk4NSwiYWFpIjoxMSwidWlkIjo3NjIxOTg5NSwiaWFkIjoiMjAyNS0xMC0wOVQwNzo1NToyMi4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.olEVa7_wuCCFJaFuYU1Qp3A8JEuyq9vQihAdA2WVL6yA"
+MONDAY_API_TOKEN ="eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjU3MTg5ODk4NSwiYWFpIjoxMSwidWlkIjo3NjIxOTg5NSwiaWFkIjoiMjAyNS0xMC0wOVQwNzo1NToyMi4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.olEVa7_wuCFJaFuYU1Qp3A8JEuyq9vQihAdA2WVL6yA" 
+
 
 # ------------------------ Validation Functions ------------------------
 def validate_search_request(data: dict) -> tuple:
@@ -277,21 +278,29 @@ def safe_send_mail(msg):
 
 # --- VALIDATION WORKFLOW: MONDAY.COM INTEGRATION ---
 def update_monday_rfq_report(project_id, report_content):
-    """Submits the validated report content to the specified Monday.com item."""
+    """
+    Submits the validated report content to the specified Monday.com item.
+    FIXED: Ensures report_content is correctly JSON-escaped for the GraphQL mutation.
+    """
     if not MONDAY_API_TOKEN or MONDAY_API_TOKEN == "YOUR_MONDAY_API_TOKEN":
         print("FATAL: Monday API Token is not configured.")
         return False, "Monday API Token not configured."
         
     item_id = project_id
-    board_id = "9550168457"
-    column_id = "long_text_mkwh4mee"
+    board_id = "9550168457"  # Replace with your board ID
+    column_id = "long_text_mkwh4mee" # Replace with your target column ID
 
+   # 1. Prepare the column value in the structure Monday.com expects for Long Text
+    # It must be a JSON object with a 'text' key.
     monday_column_object = {
         "text": report_content
     }
 
+    # 2. JSON-encode the entire object for safe transmission as the GraphQL 'value' argument
     column_value_json = json.dumps(monday_column_object) 
 
+    # 3. Construct the GraphQL mutation.
+    # The 'value' argument is where we inject the double-encoded string.
     mutation = f"""
         mutation {{
             change_column_value(
@@ -304,6 +313,8 @@ def update_monday_rfq_report(project_id, report_content):
             }}
         }}
     """
+    # NOTE: The outer json.dumps(column_value_json) ensures the inner JSON string 
+    # is safely embedded as a string literal within the GraphQL JSON payload.
     
     headers = {
         "Authorization": MONDAY_API_TOKEN,
