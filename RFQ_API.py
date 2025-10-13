@@ -1251,7 +1251,7 @@ def get_product_line_by_product_name():
 
 
 #===========================================Sales feedback =================
-def get_conn2():
+def get_connn():
     return psycopg2.connect(
         host="avo-adb-002.postgres.database.azure.com",
         user="administrationSTS",
@@ -1327,7 +1327,7 @@ def insert_feedback():
         )
  
         with get_conn2() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            with connn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(sql, vals)
                 new_id = cur.fetchone()["id"]
  
@@ -1335,6 +1335,8 @@ def insert_feedback():
  
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False)
