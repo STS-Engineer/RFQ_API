@@ -7,7 +7,7 @@ import json
 from typing import List, Dict, Any, Optional
 
 import psycopg2
-from psycopg2 import OperationalError, errorcodes, extras, RealDictCursor
+from psycopg2 import OperationalError, errorcodes, extras
 import requests
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
