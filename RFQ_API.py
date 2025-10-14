@@ -5,7 +5,6 @@ import datetime
 import sys
 import json
 from typing import List, Dict, Any, Optional
-
 import psycopg2
 from psycopg2 import OperationalError, errorcodes, extras
 import requests
@@ -346,28 +345,184 @@ def update_monday_rfq_report(project_id, report_content):
         print(f"FATAL MONDAY SUBMISSION ERROR: {error_message}")
         return False, error_message
 
-# ------------------------ Root Routes ------------------------
-@app.route('/')
-def root():
-    return {
-        "status": "online",
-        "service": "Merged RFQ & Apollo.io API with Validation Workflow",
-        "version": "2.0.0",
-        "endpoints": {
-            "rfq_submit": "/api/rfq/submit",
-            "rfq_get": "/api/rfq/get",
-            "products": "/api/products",
-            "product_lines": "/api/product-lines",
-            "product_lines_list": "/api/product-lines/list",
-            "product_lines_details": "/api/product-lines/details",
-            "apollo_search": "/apollo/search",
-            "apollo_enrich": "/apollo/enrich",
-            "apollo_bulk_enrich": "/apollo/bulk_enrich",
-            "validation_send_report": "/api/send-report",
-            "validation_page": "/validate-page",
-            "validation_handle": "/api/handle-validation"
-        }
+
+BOARD_ID = "9550168457" 
+
+
+COLUMN_IDS_RETRIEVAL = {
+    "kam": "multiple_person_mkszcpvx",         # Key Account Manager (Likely a People Column)
+    "zone_manager": "multiple_person_mkszd4qb",   # Zone Manager (Likely a People Column)
+    "vp_sales": "multiple_person_mkt0hwt1",       # VP Sales (Likely a People Column)
+    "ceo": "multiple_person_mkt1jh5b"            # CEO (Likely a People Column)
+}
+
+
+
+
+
+def _monday_post(query: str, variables: dict):
+    resp = requests.post(
+        MONDAY_API_URL,
+        json={"query": query, "variables": variables},
+        headers={
+            "Authorization": MONDAY_API_TOKEN,
+            "Content-Type": "application/json",
+            "API-Version": "2024-04",
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        # surface monday GraphQL errors so your route can report 502 instead of 404
+        raise RuntimeError(data["errors"])
+    return data["data"]
+
+def _get_user_map(user_ids: List[int]) -> Dict[int, Dict[str, str]]:
+    """Return {user_id: {name, email}} for monday user IDs."""
+    if not user_ids:
+        return {}
+    q = """
+    query($ids:[ID!]) {
+      users(ids:$ids) { id name email }
     }
+    """
+    d = _monday_post(q, {"ids": user_ids})
+    return {int(u["id"]): {"name": u.get("name"), "email": u.get("email")} for u in d.get("users", [])}
+
+def get_monday_data_by_project_id(item_id: int) -> Optional[Dict[str, str]]:
+    """
+    Retrieves KAM, Zone Manager, VP Sales, CEO names (from column text) and emails (via users()).
+    """
+    try:
+        if not MONDAY_API_TOKEN or not MONDAY_API_URL:
+            print("FATAL: Monday API Token or URL is not configured.")
+            return None
+    except NameError:
+        print("FATAL: MONDAY_API_TOKEN or MONDAY_API_URL is not defined.")
+        return None
+
+    col_id_map = {
+        "kam": COLUMN_IDS_RETRIEVAL["kam"],
+        "zone_manager": COLUMN_IDS_RETRIEVAL["zone_manager"],
+        "vp_sales": COLUMN_IDS_RETRIEVAL["vp_sales"],
+        "ceo": COLUMN_IDS_RETRIEVAL["ceo"],
+    }
+    col_ids = list(col_id_map.values())
+
+    # ✅ Corrected GraphQL: no person{email}; only persons_and_teams { id, kind }
+    query_item = """
+    query($boardId: ID!, $itemId: [ID!], $colIds: [String!]) {
+      boards(ids: [$boardId]) {
+        items_page(query_params: { ids: $itemId }) {
+          items {
+            id
+            name
+            column_values(ids: $colIds) {
+              id
+              text
+              value
+              ... on PeopleValue {
+                persons_and_teams {
+                  id
+                  kind   # "person" or "team"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    variables = {"boardId": BOARD_ID, "itemId": [str(item_id)], "colIds": col_ids}
+
+    try:
+        d = _monday_post(query_item, variables)
+    except Exception as e:
+        print("ERROR: monday.com API returned errors:")
+        print(e)
+        return None
+
+    items = d.get("boards", [{}])[0].get("items_page", {}).get("items", [])
+    if not items:
+        print(f"No item found with ID {item_id}.")
+        return None
+
+    item = items[0]
+    extracted: Dict[str, str] = {"project_id": item["id"], "project_name": item["name"]}
+
+    # collect user IDs to fetch emails in one go
+    need_user_ids: Dict[str, int] = {}
+    all_ids: List[int] = []
+
+    for col in item.get("column_values", []):
+        role = next((k for k, v in col_id_map.items() if v == col["id"]), None)
+        if not role:
+            continue
+
+        # board cell display text
+        extracted[f"{role}_name"] = col.get("text") or "N/A"
+        extracted[f"{role}_email"] = "N/A"  # default
+
+        pt = col.get("persons_and_teams")
+        # fallback: parse JSON in .value if SDK didn’t hydrate persons_and_teams
+        if not pt and col.get("value"):
+            try:
+                val = json.loads(col["value"])
+                pt = val.get("personsAndTeams")
+            except Exception:
+                pt = None
+
+        if isinstance(pt, list):
+            # choose first person (ignore teams; they don’t have emails)
+            for ent in pt:
+                if ent.get("kind") == "person" and ent.get("id") is not None:
+                    uid = int(ent["id"])
+                    need_user_ids[role] = uid
+                    all_ids.append(uid)
+                    break
+
+    # fetch emails once and map back
+    user_map = _get_user_map(sorted(set(all_ids)))
+    for role, uid in need_user_ids.items():
+        info = user_map.get(uid)
+        if info:
+            extracted[f"{role}_email"] = info.get("email") or "N/A"
+            # If you prefer directory name over board text, uncomment:
+            # extracted[f"{role}_name"] = info.get("name") or extracted[f"{role}_name"]
+
+    return extracted
+
+
+
+
+
+
+@app.route('/api/project/retrieve/<int:project_id>', methods=['GET'])
+def retrieve_project_data(project_id):
+    """
+    API route to retrieve KAM, ZM, VP Sales, and CEO names for a project ID.
+    Example: GET /api/project/retrieve/1234567890
+    """
+    data = get_monday_data_by_project_id(project_id)
+    
+    if data:
+        return jsonify({
+            "status": "success",
+            "data": data
+        }), 200
+    else:
+        return jsonify({
+            "status": "error",
+            "message": f"Project ID {project_id} not found or API error occurred."
+        }), 404
+
+
+
+
+
+
+
 
 @app.route('/health')
 def health():
