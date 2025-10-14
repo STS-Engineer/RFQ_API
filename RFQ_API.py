@@ -45,6 +45,7 @@ MONDAY_API_TOKEN ="eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjU3MTg5ODk4NSwiYWFpIjoxMSwidWlk
 
 
 # ------------------------ Validation Functions ------------------------
+# ------------------------ Validation Functions ------------------------
 def validate_search_request(data: dict) -> tuple:
     """Validates search people request data. Returns (is_valid, error_message, validated_data)"""
     if not data:
@@ -103,7 +104,66 @@ def validate_enrich_request(data: dict) -> tuple:
     }
     
     return True, None, validated
+# Add these filter functions after your validation functions and before the Apollo routes
 
+def filter_search_contact(contact: dict) -> dict:
+    """
+    Filters a contact from search results to return only essential fields.
+    Returns: name, title, email, linkedin_url, organization_name
+    """
+    organization = contact.get('organization', {}) or {}
+    
+    return {
+        "name": contact.get('name'),
+        "title": contact.get('title'),
+        "email": contact.get('email'),
+        "linkedin_url": contact.get('linkedin_url'),
+        "organization_name": organization.get('name') if isinstance(organization, dict) else None
+    }
+
+
+def filter_enrich_contact(response_data: dict) -> dict:
+    """
+    Filters enriched person data to return only essential fields.
+    Returns: first_name, last_name, name, title, email, linkedin_url, phone_numbers, organization.name
+    """
+    person = response_data.get('person', {})
+    
+    if not person:
+        return response_data  # Return as-is if no person data
+    
+    # Filter phone numbers
+    phone_numbers = person.get('phone_numbers', [])
+    filtered_phones = []
+    if isinstance(phone_numbers, list):
+        for phone in phone_numbers:
+            if isinstance(phone, dict):
+                filtered_phones.append({
+                    "raw_number": phone.get('raw_number'),
+                    "sanitized_number": phone.get('sanitized_number'),
+                    "type": phone.get('type')
+                })
+    
+    # Filter organization
+    organization = person.get('organization', {})
+    filtered_org = None
+    if isinstance(organization, dict):
+        filtered_org = {
+            "name": organization.get('name')
+        }
+    
+    return {
+        "person": {
+            "first_name": person.get('first_name'),
+            "last_name": person.get('last_name'),
+            "name": person.get('name'),
+            "title": person.get('title'),
+            "email": person.get('email'),
+            "linkedin_url": person.get('linkedin_url'),
+            "phone_numbers": filtered_phones,
+            "organization": filtered_org
+        }
+    }
 def validate_bulk_enrich_request(data: dict) -> tuple:
     """Validates bulk enrich request. Returns (is_valid, error_message, validated_data)"""
     if not data:
@@ -126,7 +186,6 @@ def validate_bulk_enrich_request(data: dict) -> tuple:
     }
     
     return True, None, validated
-
 # ------------------------ Apollo Client ------------------------
 class ApolloClient:
     """Client for Apollo.io API"""
@@ -770,13 +829,16 @@ def handle_validation():
 
 
 # ======================== APOLLO ROUTES ========================
+# ======================== APOLLO ROUTES ========================
+
+# ======================== MODIFIED APOLLO ROUTES ========================
 
 @app.route('/apollo/search', methods=['POST'])
 @app.route('/api/v1/mixed_people/search', methods=['POST'])
 def search_people_simple():
     """
     Search for people across multiple organizations.
-    Loops through each organization and aggregates results.
+    Returns filtered contact data: name, title, email, linkedin_url, organization_name
     """
     data = request.get_json()
     x_api_key = request.headers.get('X-Api-Key')
@@ -815,13 +877,16 @@ def search_people_simple():
             response_data = client.search_single_organization(payload)
 
             contacts = response_data.get("contacts", []) or response_data.get("people", [])
-            all_contacts.extend(contacts)
+            
+            # ✅ FILTER CONTACTS HERE
+            filtered_contacts = [filter_search_contact(contact) for contact in contacts]
+            all_contacts.extend(filtered_contacts)
 
             pagination = response_data.get("pagination", {})
             total_entries += pagination.get("total_entries", 0)
             organizations_searched.append(org_name)
 
-            print(f"✓ Found {len(contacts)} contacts from {org_name}")
+            print(f"✓ Found {len(filtered_contacts)} contacts from {org_name}")
 
             if idx < len(req["q_organization_name"]) - 1:
                 time.sleep(req["delay_between_requests"])
@@ -852,9 +917,14 @@ def search_people_simple():
     
     return jsonify(response), 200
 
+
 @app.route('/apollo/enrich', methods=['POST'])
 @app.route('/api/v1/people/match', methods=['POST'])
 def enrich_person():
+    """
+    Enrich a single person.
+    Returns filtered data: first_name, last_name, name, title, email, linkedin_url, phone_numbers, organization.name
+    """
     data = request.get_json()
     x_api_key = request.headers.get('X-Api-Key')
     
@@ -898,7 +968,11 @@ def enrich_person():
     try:
         client = get_apollo_client(x_api_key)
         response_data = client.enrich_person(payload)
-        return jsonify(response_data), 200
+        
+        # ✅ FILTER RESPONSE HERE
+        filtered_response = filter_enrich_contact(response_data)
+        
+        return jsonify(filtered_response), 200
     except RuntimeError as e:
         return jsonify({"status": "error", "message": str(e)}), 500
     except requests.exceptions.HTTPError as e:
@@ -908,9 +982,14 @@ def enrich_person():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 @app.route('/apollo/bulk_enrich', methods=['POST'])
 @app.route('/api/v1/people/bulk_match', methods=['POST'])
 def bulk_enrich_people():
+    """
+    Bulk enrich multiple people.
+    Returns filtered data for each match.
+    """
     data = request.get_json()
     x_api_key = request.headers.get('X-Api-Key')
     
@@ -935,7 +1014,19 @@ def bulk_enrich_people():
     try:
         client = get_apollo_client(x_api_key)
         response_data = client.bulk_enrich(payload)
-        return jsonify(response_data), 200
+        
+        # ✅ FILTER BULK RESPONSE HERE
+        matches = response_data.get("matches", [])
+        filtered_matches = [filter_enrich_contact(match) for match in matches]
+        
+        filtered_response = {
+            "matches": filtered_matches,
+            "total_requested": response_data.get("total_requested"),
+            "total_matched": response_data.get("total_matched"),
+            "credits_consumed": response_data.get("credits_consumed")
+        }
+        
+        return jsonify(filtered_response), 200
     except RuntimeError as e:
         return jsonify({"status": "error", "message": str(e)}), 500
     except requests.exceptions.HTTPError as e:
