@@ -1496,6 +1496,61 @@ def get_product_line_by_product_name():
             conn.close()
 
 
+@app.route('/api/rfq/max-id', methods=['GET'])
+def get_max_rfq_id():
+    """
+    Retrieves the maximum rfq_id from the 'main' table.
+    This helps in generating the next sequential RFQ ID.
+    """
+    conn = None
+    try:
+        conn, cursor = get_db()
+
+        # Assuming rfq_id is a unique identifier (like an integer or serial number)
+        # If rfq_id is a string, you might need to cast it or adjust the query based on your ID format.
+        # This query assumes it can be max()'d directly, which works for sequential number formats.
+        query = "SELECT MAX(id) AS max_rfq_id FROM main;"
+        cursor.execute(query)
+
+        result = cursor.fetchone()
+        max_id = result['max_rfq_id'] if result and 'max_rfq_id' in result else None
+
+        if max_id is None:
+            # If the table is empty, return a starting value, e.g., 0
+            # or the first actual ID to be generated (e.g., '1000' if using a prefix).
+            # We'll return 0 here, assuming IDs are numbers or strings that sort correctly.
+            return jsonify({
+                "status": "success",
+                "message": "Table is empty, returning initial ID.",
+                "max_rfq_id": 0
+            }), 200
+
+        return jsonify({
+            "status": "success",
+            "message": "Successfully retrieved maximum RFQ ID.",
+            "max_rfq_id": max_id
+        }), 200
+
+    except ConnectionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    except OperationalError as e:
+        pg_error_message = getattr(e, 'pgerror', str(e))
+        return jsonify({
+            "status": "error",
+            "message": f"Database query failed: {pg_error_message}"
+        }), 500
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False)
