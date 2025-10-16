@@ -805,9 +805,6 @@ def handle_validation():
             <h3 style="color: {color};">Decision: {action.upper()}</h3><h4>Validator Comments:</h4><div style="border-left: 5px solid {color}; padding: 10px; background-color: #e9f5ff; border-radius: 0 4px 4px 0; margin-bottom: 20px;"><p style="margin: 0;">{comments}</p></div>
             <h4>Database Submission Status: <span style="color: {'#4CAF50' if db_submission_status == 'SUCCESS' else '#F44336'};">{db_submission_status}</span></h4>
             {f'<p style="color: #F44336;">External RFQ Error: {db_submission_error}</p>' if db_submission_status != 'SUCCESS' else ''}
-            
-            <h4>Monday.com Update Status (Confirmation Only): <span style="color: {'#4CAF50' if monday_update_status == 'SUCCESS' else ('#FFC107' if monday_update_status == 'SKIPPED' else '#F44336')};">{monday_update_status}</span></h4>
-            {f'<p style="color: #F44336;">Monday.com Error: {monday_update_error}</p>' if monday_update_status == 'FAILED' else ''}
 
             <p style="margin-top: 20px;">Thank you for using the AI Assistant.</p></body></html>
     """
