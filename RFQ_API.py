@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 import psycopg2
 from psycopg2 import OperationalError, errorcodes, extras
 import requests
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify
 from flask_mail import Mail, Message
 
@@ -24,6 +25,13 @@ DB_CONFIG = {
     "user": "administrationSTS",
     "password": "St$@0987"
 }
+CLIENT_DB_CONFIG = {
+    "host": "avo-adb-002.postgres.database.azure.com",
+    "database": "Client_DB", # Client/Organization data (Groupe, Unit, Person)
+    "user": "administrationSTS",
+    "password": "St$@0987"
+}
+
 
 app = Flask(__name__)
 
@@ -1619,6 +1627,190 @@ def check_contact_existence():
     finally:
         if conn:
             conn.close()
+
+
+@app.route('/api/data/ingest', methods=['POST'])
+def data_ingestion():
+    """
+    Ingests new Customer (Groupe), Plant (Unit), and Contact (Person) data 
+    from a generated RFQ payload if the records do not already exist.
+    
+    This endpoint uses CLIENT_DB connection (not RFQ_DATA).
+    
+    Expected additional fields for the assistant user:
+    - assistant_user_email
+    - assistant_user_first_name
+    - assistant_user_last_name
+    - assistant_user_job_title
+    """
+    data = request.get_json()
+    conn = None
+
+    if not data:
+        return jsonify({"status": "error", "message": "No data provided"}), 400
+
+    # Required fields check
+    required_keys = [
+        'customer_name', 'delivery_zone', 'plant_name', 'city', 'country', 
+        'contact_email', 'contact_first_name', 'contact_last_name', 
+        'contact_job_title', 'contact_phone', 'contact_role', # RFQ contact info
+        'assistant_user_email', 'assistant_user_first_name', 'assistant_user_last_name', 'assistant_user_job_title' # Assistant info
+    ]
+    if not all(key in data and data[key] is not None for key in required_keys):
+        missing = [key for key in required_keys if key not in data or data[key] is None]
+        return jsonify({"status": "error", "message": f"Missing or null required fields: {', '.join(missing)}"}), 400
+
+    # Extracting data
+    customer_name = data['customer_name']
+    delivery_zone = data['delivery_zone']
+    plant_name = data['plant_name']
+    city = data['city']
+    country = data['country']
+    
+    # RFQ Contact data
+    contact_email = data['contact_email']
+    contact_first_name = data['contact_first_name']
+    contact_last_name = data['contact_last_name']
+    contact_job_title = data['contact_job_title']
+    contact_phone = data['contact_phone']
+    contact_role = data['contact_role']
+
+    # Assistant/Commercial data
+    assistant_email = data['assistant_user_email']
+    assistant_first_name = data['assistant_user_first_name']
+    assistant_last_name = data['assistant_user_last_name']
+    assistant_job_title = data['assistant_user_job_title'] # Used as Commercial's job title
+
+    try:
+        # IMPORTANT: Connect to Client_DB instead of RFQ_DATA
+        conn = psycopg2.connect(**CLIENT_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        # --- 0. Assistant/Commercial Person Ingestion ---
+        # The assistant user is the Commercial Person for the unit. Role is set to 'Commercial'.
+        assistant_person_id = None
+        cursor.execute('SELECT "Person_id" FROM public."Person" WHERE email = %s;', (assistant_email,))
+        existing_assistant = cursor.fetchone()
+        
+        if existing_assistant:
+            assistant_person_id = existing_assistant['Person_id']
+            assistant_status = "EXISTING"
+        else:
+            # Get next ID for Person table
+            cursor.execute('SELECT COALESCE(MAX("Person_id"), 0) + 1 AS next_id FROM public."Person";')
+            result = cursor.fetchone()
+            assistant_person_id = result['next_id'] if result else 1
+            
+            insert_assistant_sql = '''
+                INSERT INTO public."Person" ("Person_id", first_name, last_name, job_title, email, phone_number, role, zone_name) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+            '''
+            cursor.execute(insert_assistant_sql, (
+                assistant_person_id, assistant_first_name, assistant_last_name, 
+                assistant_job_title, assistant_email, None, 'Commercial', delivery_zone
+            ))
+            assistant_status = "NEW"
+
+        # --- 1. Groupe/Customer Ingestion ---
+        groupe_id = None
+        cursor.execute("SELECT groupe_id FROM public.groupe WHERE groupe_name = %s;", (customer_name,))
+        existing_groupe = cursor.fetchone()
+        
+        if existing_groupe:
+            groupe_id = existing_groupe['groupe_id']
+            groupe_status = "EXISTING"
+        else:
+            # Get next ID for groupe table
+            cursor.execute('SELECT COALESCE(MAX(groupe_id), 0) + 1 AS next_id FROM public.groupe;')
+            result = cursor.fetchone()
+            groupe_id = result['next_id'] if result else 1
+            
+            insert_groupe_sql = "INSERT INTO public.groupe (groupe_id, groupe_name) VALUES (%s, %s);"
+            cursor.execute(insert_groupe_sql, (groupe_id, customer_name))
+            groupe_status = "NEW"
+
+        # --- 2. Unit/Plant Ingestion ---
+        unit_id = None
+        # Check existence based on unit_name (plant_name) and group
+        cursor.execute("SELECT unit_id FROM public.unit WHERE unit_name = %s AND groupe_id = %s;", (plant_name, groupe_id))
+        existing_unit = cursor.fetchone()
+
+        if existing_unit:
+            unit_id = existing_unit['unit_id']
+            unit_status = "EXISTING"
+            
+            # If the unit already exists, update the com_person_id 
+            update_unit_sql = "UPDATE public.unit SET com_person_id = %s WHERE unit_id = %s;"
+            cursor.execute(update_unit_sql, (assistant_person_id, unit_id))
+        else:
+            # Get next ID for unit table
+            cursor.execute('SELECT COALESCE(MAX(unit_id), 0) + 1 AS next_id FROM public.unit;')
+            result = cursor.fetchone()
+            unit_id = result['next_id'] if result else 1
+            
+            insert_unit_sql = "INSERT INTO public.unit (unit_id, groupe_id, unit_name, city, country, zone_name, com_person_id) VALUES (%s, %s, %s, %s, %s, %s, %s);"
+            cursor.execute(insert_unit_sql, (unit_id, groupe_id, plant_name, city, country, delivery_zone, assistant_person_id))
+            unit_status = "NEW"
+            
+        # --- 3. RFQ Contact Person Ingestion (Must be separate from Assistant Person) ---
+        person_id = None
+        cursor.execute('SELECT "Person_id" FROM public."Person" WHERE email = %s;', (contact_email,))
+        existing_person = cursor.fetchone()
+        
+        if existing_person:
+            person_id = existing_person['Person_id']
+            person_status = "EXISTING"
+        else:
+            # Get next ID for Person table
+            cursor.execute('SELECT COALESCE(MAX("Person_id"), 0) + 1 AS next_id FROM public."Person";')
+            result = cursor.fetchone()
+            person_id = result['next_id'] if result else 1
+            
+            # Note: factory_id in Person table maps to unit_id
+            insert_person_sql = '''
+                INSERT INTO public."Person" ("Person_id", factory_id, first_name, last_name, job_title, email, phone_number, role, zone_name) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+            '''
+            cursor.execute(insert_person_sql, (
+                person_id, unit_id, contact_first_name, contact_last_name, 
+                contact_job_title, contact_email, contact_phone, contact_role, delivery_zone
+            ))
+            person_status = "NEW"
+
+        conn.commit()
+
+        return jsonify({
+            "status": "success",
+            "message": "Data ingestion complete. Records inserted only if new.",
+            "groupe": {"status": groupe_status, "id": groupe_id, "name": customer_name},
+            "unit": {"status": unit_status, "id": unit_id, "name": plant_name, "com_person_id": assistant_person_id},
+            "contact_person": {"status": person_status, "id": person_id, "email": contact_email},
+            "commercial_person": {"status": assistant_status, "id": assistant_person_id, "email": assistant_email}
+        }), 200
+
+    except psycopg2.Error as e:
+        if conn:
+            conn.rollback()
+            
+        pg_error_message = getattr(e, 'pgerror', None)
+        detail_message = pg_error_message.strip() if pg_error_message else str(e)
+
+        return jsonify({
+            "status": "error",
+            "message": f"Database ingestion failed (PostgreSQL Error): {detail_message}"
+        }), 500
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+            
+        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
+        
+    finally:
+        if conn:
+            cursor.close()
+            conn.close()
+
 
 
 
