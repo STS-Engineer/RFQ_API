@@ -741,6 +741,9 @@ def handle_validation():
     request_data['validator_comments'] = comments
     request_data['validated_at'] = datetime.datetime.now().isoformat()
     set_request_data(request_id, request_data)
+    # Get the emails from the stored request data
+    created_by_email = request_data.get('user_email')
+    validated_by_email = request_data.get('validator_email')
 
     # 2. Prepare Final RFQ Payload
     original_rfq_payload = request_data.get('rfq_payload')
@@ -750,10 +753,17 @@ def handle_validation():
         db_submission_status = "FAILED"
         payload_to_send = None
     else:
+        # Extract emails from the stored request_data
+        created_by_email = request_data.get('user_email')
+        validated_by_email = request_data.get('validator_email')
+        
         payload_to_send = {
             **original_rfq_payload,
-            "status": action.upper(),       
-            "validator_comments": comments   
+            "status": action.upper(),      
+            "validator_comments": comments,
+            # NEW FIELDS ADDED HERE
+            "created_by_email": created_by_email,
+            "validated_by_email": validated_by_email
         }
         db_submission_status = "PENDING"
 
@@ -1052,7 +1062,8 @@ def submit_rfq_data():
     # Extract validation fields if present
     final_status = data.pop('status', None) 
     final_validator_comments = data.pop('validator_comments', None)
-
+    created_by_email = data.pop('created_by_email', None)
+    validated_by_email = data.pop('validated_by_email', None)
     # Normalize status from list to string if needed
     if isinstance(final_status, list) and final_status:
         final_status = final_status[0]
@@ -1108,7 +1119,7 @@ def submit_rfq_data():
             'risks', 'decision', 'design_responsibility', 'validation_responsibility', 'design_ownership',
             'development_costs', 'technical_capacity', 'scope_alignment', 'overall_feasibility',
             'customer_status', 'strategic_note', 'final_recommendation', 'contact_id_fk', 
-            'validator_comments', 'status'
+            'validator_comments', 'status','created_by_email', 'validated_by_email'
         ]
 
         main_values = [
@@ -1127,7 +1138,7 @@ def submit_rfq_data():
             data.get('overall_feasibility'), data.get('customer_status'), data.get('strategic_note'), 
             data.get('final_recommendation'), 
             contact_id_fk, 
-            final_validator_comments, final_status
+            final_validator_comments, final_status,created_by_email, validated_by_email
         ]
 
         columns_sql = ', '.join(COLUMN_NAMES)
@@ -1171,6 +1182,7 @@ def submit_rfq_data():
             cursor.close()
         if conn:
             conn.close()
+
 
 @app.route('/api/rfq/get', methods=['GET'])
 def get_rfq_data():
