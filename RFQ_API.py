@@ -1549,6 +1549,70 @@ def get_max_rfq_id():
             conn.close()
 
 
+@app.route('/api/contact/check', methods=['GET'])
+def check_contact_existence():
+    """
+    Checks the existence of a contact in the database using their email.
+    If found, returns the contact's role and phone number.
+    Example: GET /api/contact/check?email=buyer@example.com
+    """
+    email = request.args.get('email')
+
+    if not email:
+        return jsonify({
+            "status": "error",
+            "message": "Missing required query parameter: email."
+        }), 400
+
+    conn = None
+    try:
+        conn, cursor = get_db()
+        
+        # NOTE: Using ILIKE for case-insensitive matching
+        query = """
+            SELECT contact_role, contact_phone
+            FROM contact
+            WHERE contact_email ILIKE %s;
+        """
+        cursor.execute(query, (email,))
+        result = cursor.fetchone()
+
+        if result:
+            return jsonify({
+                "status": "success",
+                "message": "Contact found.",
+                "contact_exists": True,
+                "contact_role": result['contact_role'],
+                "contact_phone": result['contact_phone']
+            }), 200
+        else:
+            return jsonify({
+                "status": "success",
+                "message": "Contact not found.",
+                "contact_exists": False,
+                "contact_role": None,
+                "contact_phone": None
+            }), 200
+
+    except ConnectionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+    except OperationalError as e:
+        pg_error_message = getattr(e, 'pgerror', str(e))
+        return jsonify({
+            "status": "error",
+            "message": f"Database query failed: {pg_error_message}"
+        }), 500
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
+        
+    finally:
+        if conn:
+            conn.close()
+
+
+
 
 
 if __name__ == '__main__':
