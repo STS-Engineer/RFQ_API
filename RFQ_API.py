@@ -487,8 +487,11 @@ CUSTOMER_AREA_LABEL_IDS = {
     "korea / japan": 1,
     "india": 2,
     "north america": 3,
-    "east asia": 4,  # ← if this one really exists in your board config
+    "east asia": 4,
+    "europe" : 105,
+    "south america" : 156
 }
+
 
 def map_customer_area_to_id(value: str) -> int | None:
     """
