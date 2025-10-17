@@ -4,6 +4,7 @@ import uuid
 import datetime
 import sys
 import json
+import re
 from typing import List, Dict, Any, Optional
 import psycopg2
 from psycopg2 import OperationalError, errorcodes, extras
@@ -343,74 +344,326 @@ def safe_send_mail(msg):
         return False, str(e)
 
 # --- VALIDATION WORKFLOW: MONDAY.COM INTEGRATION ---
-def update_monday_rfq_report(project_id, report_content):
-    """
-    Submits the validated report content to the specified Monday.com item.
-    FIXED: Ensures report_content is correctly JSON-escaped for the GraphQL mutation.
-    """
-    if not MONDAY_API_TOKEN or MONDAY_API_TOKEN == "YOUR_MONDAY_API_TOKEN":
-        print("FATAL: Monday API Token is not configured.")
-        return False, "Monday API Token not configured."
-        
-    item_id = project_id
-    board_id = "9550168457"  # Replace with your board ID
-    column_id = "long_text_mkwh4mee" # Replace with your target column ID
+def _normalize_str(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-   # 1. Prepare the column value in the structure Monday.com expects for Long Text
-    # It must be a JSON object with a 'text' key.
-    monday_column_object = {
-        "text": report_content
+def map_customer_area(input_value: str, country: Optional[str] = None) -> Optional[str]:
+    """
+    Maps user inputs to Monday Status labels for 'Customer Area'.
+    Allowed labels: 'Asia', 'Korea / Japan', 'India', 'North America', 'Europe', 'South America'
+    """
+    v = _normalize_str(input_value)
+    c = _normalize_str(country) if country else None
+
+    # Exact board labels
+    exact = {
+        "asia": "Asia",
+        "korea / japan": "Korea / Japan",
+        "india": "India",
+        "north america": "North America",
+        "europe": "Europe",
+        "south america": "South America",
+    }
+    if v in exact:
+        return exact[v]
+
+    # Canonical inputs you said you'll receive + common aliases
+    alias = {
+        "nafta": "North America",
+        "north-america": "North America",
+        "n. america": "North America",
+        "amer": "North America",
+        "na": "North America",
+
+        "europe": "Europe",
+        "eu": "Europe",
+
+        "south america": "South America",
+        "south-america": "South America",
+        "s. america": "South America",
+        "latam": "South America",
+
+        "apac": "Asia",
+        "east asia": "Asia",
+        "south asia": "Asia",
+        "se asia": "Asia",
+        "sea": "Asia",
     }
 
-    # 2. JSON-encode the entire object for safe transmission as the GraphQL 'value' argument
-    column_value_json = json.dumps(monday_column_object) 
+    if v in alias:
+        candidate = alias[v]
+        # Refinements by country for East/South Asia
+        if v in {"apac", "east asia"} and c:
+            if c in {"jp", "japan", "kr", "korea", "south korea"}:
+                return "Korea / Japan"
+            return "Asia"
+        if v == "south asia" and c:
+            if c in {"in", "india"}:
+                return "India"
+            return "Asia"
+        return candidate
 
-    # 3. Construct the GraphQL mutation.
-    # The 'value' argument is where we inject the double-encoded string.
+    # Country-based fallbacks
+    if v in {"jp", "japan", "kr", "korea", "south korea"}:
+        return "Korea / Japan"
+    if v in {"in", "india"}:
+        return "India"
+
+    # Keyword fallbacks
+    if "east asia" in v:
+        return "Korea / Japan" if c in {"jp","japan","kr","korea","south korea"} else "Asia"
+    if "south asia" in v:
+        return "India" if c in {"in","india"} else "Asia"
+    if "europe" in v:
+        return "Europe"
+    if "nafta" in v or "north america" in v or "usa" in v or "canada" in v or "mexico" in v:
+        return "North America"
+    if "south america" in v or "latam" in v:
+        return "South America"
+
+    return None
+
+
+# Customer Area label ID mapping (from Monday board)
+
+# --- ADD THIS FUNCTION ABOVE create_monday_rfq_item ---
+def map_zone_responsible_email(zone_name: str) -> Optional[str]:
+    """Maps a normalized zone name to the corresponding Zone Responsible email."""
+    v = (zone_name or "").strip().lower()
+    
+    # Use the normalized names derived from map_customer_area
+    if "korea / japan" in v or "east asia" in v or "asia" in v:
+        return "tao.ren@avocarbon.com"
+    elif "india" in v or "south asia" in v:
+        return "eipe.thomas@avocarbon.com"
+    elif "europe" in v or "eu" in v:
+        return "franck.lagadec@avocarbon.com"
+    elif "south america" in v or "north america" in v or "nafta" in v:
+        return "dean.hayward@avocarbon.com"
+    # Note: If 'Asia' is the result of normalization but isn't explicitly 'East' or 'South', 
+    # it currently falls back to Tao Ren, which aligns with the first mapping (East Asia/Korea/Japan) if only 'Asia' is provided.
+    
+    return None
+
+def _monday_query(query: str, variables: dict | None = None) -> dict:
+    headers = {"Authorization": MONDAY_API_TOKEN, "Content-Type": "application/json"}
+    payload = {"query": query}
+    if variables is not None:
+        payload["variables"] = variables
+    r = requests.post(MONDAY_API_URL, json=payload, headers=headers, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if "errors" in data:
+        raise RuntimeError(f"Monday GraphQL error: {data['errors']}")
+    return data["data"]
+
+def get_user_id_by_email(email: str) -> int | None:
+    """
+    Resolve a monday user ID from an email.
+    We fetch pages of users and match email client-side to avoid schema changes.
+    """
+    page = 1
+    while True:
+        q = """
+        query ($limit:Int!, $page:Int!){
+          users (limit:$limit, page:$page) {
+            id
+            name
+            email
+            is_guest
+          }
+        }"""
+        data = _monday_query(q, {"limit": 200, "page": page})
+        users = data.get("users") or []
+        if not users:
+            return None
+        for u in users:
+            if (u.get("email") or "").strip().lower() == (email or "").strip().lower():
+                return int(u["id"])
+        page += 1
+
+CUSTOMER_AREA_LABEL_IDS = {
+    "asia": 0,
+    "korea / japan": 1,
+    "india": 2,
+    "north america": 3,
+    "east asia": 4,  # ← if this one really exists in your board config
+}
+
+def map_customer_area_to_id(value: str) -> int | None:
+    """
+    Maps input strings like 'Asia', 'AMER', 'APAC', etc. to their label IDs.
+    Returns None if no valid mapping is found.
+    """
+    v = (value or "").strip().lower()
+
+    # Direct match if using existing labels
+    if v in CUSTOMER_AREA_LABEL_IDS:
+        return CUSTOMER_AREA_LABEL_IDS[v]
+
+    # Common synonyms
+    alias = {
+        "amer": "north america",
+        "nafta": "north america",
+        "na": "north america",
+        "north-america": "north america",
+        "apac": "asia",
+        "east asia": "east asia",
+        "south asia": "india",  # depending on your board config
+        "emea": "asia",         # fallback if not separately labeled
+    }
+
+    if v in alias and alias[v] in CUSTOMER_AREA_LABEL_IDS:
+        return CUSTOMER_AREA_LABEL_IDS[alias[v]]
+
+    return None
+
+
+
+def create_monday_rfq_item(rfq_data: Dict[str, Any], report_content: str, request_data: Dict[str, Any]) -> tuple[bool, Optional[str]]:
+    NEW_COLUMN_IDS = {
+        "customer_name_col": "text_mkwr9zq7",
+        "application": "dropdown_mksz6mxa",        # Dropdown
+        "product_line": "color_mkspxcz1",          # Status/Color
+        "sop_year": "numeric_mksp7jqy",
+        "target_price_eur": "numeric_mkszczs",
+        "delivery_zone": "color_mksydtj9",         # Status/Color
+        "overall_feasibility": "long_text_mkws5y8x",
+        "kam_col": "multiple_person_mkszcpvx",       # KAM - Mapped to request_data['user_email']
+        "zone_responsible_col": "multiple_person_mkszd4qb", # Zone Manager/Responsible - Mapped via logic
+        "validator_col": "multiple_person_mkt1vhsa"    # Validator - Mapped to request_data['validator_email']
+    }
+    AI_REPORT_COLUMN_ID = "long_text_mkwh4mee"
+
+    MONDAY_API_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjU3MTg5ODk4NSwiYWFpIjoxMSwidWlkIjo3NjIxOTg5NSwiaWFkIjoiMjAyNS0xMC0wOVQwNzo1NToyMi4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.olEVa7_wuCFJaFuYU1Qp3A8JEuyq9vQihAdA2WVL6yA"  # 🔒 never hardcode secrets
+    MONDAY_API_URL = "https://api.monday.com/v2"
+    BOARD_ID = "9550168457"
+
+    if not MONDAY_API_TOKEN:
+        return False, "Monday API Token not configured."
+
+    # ✅ Allowed labels (exactly as configured on the board)
+    allowed_product_line_labels = {"Assembly","Friction","Injection","Chokes","Brushes","Seals"}
+    
+    customer_name = rfq_data.get('customer_name', 'Unnamed RFQ')
+    safe_item_name = json.dumps(f"{customer_name} RFQ")  # ensures proper escaping in GraphQL
+    raw_area = rfq_data.get("delivery_zone") or rfq_data.get("customer_area") or ""
+    
+    
+    country_hint = rfq_data.get("country")  # optional, if you have it
+    mapped_area = map_customer_area(raw_area, country_hint)
+    if not mapped_area:
+        return False, ("Invalid Customer Area "
+                    f"'{raw_area}'. Allowed: Asia, Korea / Japan, India, North America, Europe, South America")
+
+    # Determine Zone Responsible Email based on MAPPED Area Label
+    zone_responsible_email = map_zone_responsible_email(mapped_area)
+    if not zone_responsible_email:
+        return False, f"Could not map Zone Responsible email for area: {mapped_area}"
+        
+    kam_email = request_data.get('user_email')
+    validator_email_to_set = request_data.get('validator_email')
+    
+    if not kam_email:
+        return False, "Missing user_email (KAM) in request_data."
+    if not validator_email_to_set:
+        return False, "Missing validator_email in request_data."
+
+
+
+    # --- Resolve People → IDs ---
+    kam_id = get_user_id_by_email(kam_email)
+    validator_id = get_user_id_by_email(validator_email_to_set)
+    zone_responsible_id = get_user_id_by_email(zone_responsible_email)
+
+    missing = []
+    if kam_id is None: missing.append(f"KAM '{kam_email}'")
+    if validator_id is None: missing.append(f"Validator '{validator_email_to_set}'")
+    if zone_responsible_id is None: missing.append(f"Zone Responsible '{zone_responsible_email}'")
+    if missing:
+        return False, "Unknown monday user(s): " + ", ".join(missing)
+
+
+
+
+    # --- Validate / normalize inputs ---
+    raw_pl = (rfq_data.get('product_line') or "").strip()
+    if raw_pl not in allowed_product_line_labels:
+        return False, (f"Invalid product_line '{raw_pl}'. Allowed: {sorted(allowed_product_line_labels)}")
+
+    raw_area = (rfq_data.get("delivery_zone") or rfq_data.get("customer_area") or "").strip()
+    area_label_id = map_customer_area_to_id(raw_area)
+
+    if area_label_id is None:
+        return False, (f"Invalid Customer Area '{raw_area}'. "
+                    f"Allowed keys: {list(CUSTOMER_AREA_LABEL_IDS.keys())}")
+
+    application_value = (rfq_data.get('application') or "").strip()
+    if not application_value:
+        return False, "Missing application"
+
+    # --- BUILD COLUMN VALUES ---
+    column_values = {
+        NEW_COLUMN_IDS["customer_name_col"]: customer_name,
+        NEW_COLUMN_IDS["sop_year"]: str(rfq_data.get('sop_year') or ""),
+        NEW_COLUMN_IDS["target_price_eur"]: str(rfq_data.get('target_price_eur') or ""),
+
+        # Dropdown expects {"labels": ["..."]} and label must exist on the column
+        NEW_COLUMN_IDS["application"]: {"labels": [application_value]},
+
+        # Status/Color expects an existing label
+        NEW_COLUMN_IDS["product_line"]: {"label": raw_pl},
+        NEW_COLUMN_IDS["delivery_zone"]: {"index": area_label_id},
+
+        NEW_COLUMN_IDS["overall_feasibility"]: {"text": rfq_data.get('overall_feasibility') or ""},
+        AI_REPORT_COLUMN_ID: {"text": report_content or ""},
+
+        # --- PEOPLE COLUMNS (Mandatory structure: {"personsAndTeams": [{"id": email_string, "kind": "email"}]}) ---
+        # 1. KAM (User Email)
+        NEW_COLUMN_IDS["kam_col"]: {
+    "personsAndTeams": [{"id": kam_id, "kind": "person"}]
+        },
+        NEW_COLUMN_IDS["zone_responsible_col"]: {
+            "personsAndTeams": [{"id": zone_responsible_id, "kind": "person"}]
+        },
+        NEW_COLUMN_IDS["validator_col"]: {
+            "personsAndTeams": [{"id": validator_id, "kind": "person"}]
+        }
+    }
+
+    column_values_json = json.dumps(column_values)
+
     mutation = f"""
         mutation {{
-            change_column_value(
-                board_id: "{board_id}",  
-                item_id: "{item_id}",    
-                column_id: "{column_id}", 
-                value: {json.dumps(column_value_json)} 
+            create_item(
+                board_id: {BOARD_ID},
+                item_name: {safe_item_name},
+                column_values: {json.dumps(column_values_json)}
             ) {{
                 id
             }}
         }}
     """
-    # NOTE: The outer json.dumps(column_value_json) ensures the inner JSON string 
-    # is safely embedded as a string literal within the GraphQL JSON payload.
-    
+
     headers = {
-        "Authorization": MONDAY_API_TOKEN,
+        "Authorization": MONDAY_API_TOKEN,  # Monday expects the raw token (no 'Bearer')
         "Content-Type": "application/json"
     }
 
     try:
-        print(f"DEBUG: Attempting to update Monday.com item {item_id} with report content...")
-        response = requests.post(
-            MONDAY_API_URL,
-            json={'query': mutation},
-            headers=headers
-        )
-        response.raise_for_status()
-        
-        response_data = response.json()
-        if 'errors' in response_data:
-            return False, f"GraphQL Error: {response_data['errors']}"
-            
-        print(f"DEBUG: Monday.com update successful for item {item_id}.")
-        return True, None
-        
+        resp = requests.post(MONDAY_API_URL, json={"query": mutation}, headers=headers, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+        if "errors" in payload:
+            return False, f"GraphQL Error: {payload['errors']}"
+        return True, payload["data"]["create_item"]["id"]
     except requests.exceptions.RequestException as e:
-        error_message = f"Monday.com API Request Failed: {e}"
-        print(f"FATAL MONDAY SUBMISSION ERROR: {error_message}")
-        return False, error_message
+        return False, f"Monday.com API Request Failed: {e}"
     except Exception as e:
-        error_message = f"Unexpected Error during Monday update: {e}"
-        print(f"FATAL MONDAY SUBMISSION ERROR: {error_message}")
-        return False, error_message
+        return False, f"Unexpected Error during Monday item creation: {e}"
+
+
+
 
 
 BOARD_ID = "9550168457" 
@@ -749,6 +1002,7 @@ def handle_validation():
     request_data['validator_comments'] = comments
     request_data['validated_at'] = datetime.datetime.now().isoformat()
     set_request_data(request_id, request_data)
+
     # Get the emails from the stored request data
     created_by_email = request_data.get('user_email')
     validated_by_email = request_data.get('validator_email')
@@ -799,19 +1053,25 @@ def handle_validation():
     monday_update_error = ""
     
     if action == 'confirm':
-        project_id = request_data.get('project_id')
+        # We no longer need project_id since we are creating a NEW item
+        rfq_payload = request_data.get('rfq_payload')
         report_content = request_data.get('report_content')
         
-        if project_id and report_content:
-            monday_ok, monday_err = update_monday_rfq_report(project_id, report_content)
+        if rfq_payload and report_content:
+            # 💡 CALLING THE NEW ITEM CREATION FUNCTION
+            monday_ok, monday_result = create_monday_rfq_item(rfq_payload, report_content, request_data)
+            
             if monday_ok:
                 monday_update_status = "SUCCESS"
+                # Store the new Monday item ID for logging/tracking if needed
+                request_data['monday_item_id'] = monday_result
+                set_request_data(request_id, request_data) # Persist the new ID
             else:
                 monday_update_status = "FAILED"
-                monday_update_error = monday_err
+                monday_update_error = monday_result
         else:
             monday_update_status = "FAILED"
-            monday_update_error = "Missing project_id or report_content in stored data."
+            monday_update_error = "Missing rfq_payload or report_content in stored data for Monday item creation."
 
     # 5. Send Final Email to User
     user_email = request_data['user_email']
@@ -823,6 +1083,9 @@ def handle_validation():
             <h3 style="color: {color};">Decision: {action.upper()}</h3><h4>Validator Comments:</h4><div style="border-left: 5px solid {color}; padding: 10px; background-color: #e9f5ff; border-radius: 0 4px 4px 0; margin-bottom: 20px;"><p style="margin: 0;">{comments}</p></div>
             <h4>Database Submission Status: <span style="color: {'#4CAF50' if db_submission_status == 'SUCCESS' else '#F44336'};">{db_submission_status}</span></h4>
             {f'<p style="color: #F44336;">External RFQ Error: {db_submission_error}</p>' if db_submission_status != 'SUCCESS' else ''}
+            
+            <h4>Monday.com Update Status (Confirmation Only): <span style="color: {'#4CAF50' if monday_update_status == 'SUCCESS' else ('#FFC107' if monday_update_status == 'SKIPPED' else '#F44336')};">{monday_update_status}</span></h4>
+            {f'<p style="color: #F44336;">Monday.com Error: {monday_update_error}</p>' if monday_update_status == 'FAILED' else ''}
 
             <p style="margin-top: 20px;">Thank you for using the AI Assistant.</p></body></html>
     """
