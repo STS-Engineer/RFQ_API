@@ -2227,47 +2227,58 @@ def check_groupe_existence():
 
 @app.route('/api/upload-file', methods=['POST'])
 def upload_file():
-    """
-    Handles file upload from the assistant, saves it locally, and returns the path.
-    The file should be sent as 'file' in a form-data request.
-    """
-    if 'file' not in request.files:
-        return jsonify({"message": "No file part in the request"}), 400
-    
-    file = request.files['file']
-    
-    if file.filename == '':
-        return jsonify({"message": "No selected file"}), 400
+    data = request.get_json(silent=True) or {}
+    refs = data.get('openaiFileIdRefs', [])
+    if not refs:
+        return jsonify({"message": "No openaiFileIdRefs in request"}), 400
 
-    if file and allowed_file(file.filename):
-        # 1. Secure filename and create a unique name to prevent collisions
-        original_filename = secure_filename(file.filename)
-        # Use a timestamped, unique filename structure (e.g., rfq_upload_UUID.ext)
-        file_extension = original_filename.rsplit('.', 1)[1].lower()
-        unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{file_extension}"
-        
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-        
-        try:
-            file.save(filepath)
-            
-            # The path to be stored and passed around (relative path from root)
-            relative_path = f'rfq_files/{unique_filename}'
-            
-            print(f"DEBUG: File uploaded successfully: {relative_path}")
-            return jsonify({
-                "status": "success",
-                "message": "File uploaded successfully.",
-                "file_path": relative_path,
-                "original_filename": original_filename
-            }), 200
-        
-        except Exception as e:
-            print(f"ERROR: Failed to save file: {e}")
-            return jsonify({"message": f"Server error saving file: {e}"}), 500
+    # GPT sends objects at runtime; allow both strings and objects:
+    first = refs[0]
+    if isinstance(first, dict):
+        download_link = first.get('download_link')
+        original_name = first.get('name') or 'uploaded_file'
+        mime_type = first.get('mime_type')
     else:
-        return jsonify({"message": "File type not allowed"}), 400
+        # If it ever sends strings, treat as URL
+        download_link = first
+        original_name = 'uploaded_file'
+        mime_type = None
 
+    if not download_link:
+        return jsonify({"message": "Missing download_link"}), 400
+
+    try:
+        # Fetch the file (link expires in ~5 minutes)
+        r = requests.get(download_link, stream=True, timeout=10)
+        r.raise_for_status()
+
+        # Decide extension
+        filename_safe = secure_filename(original_name)
+        ext = filename_safe.rsplit('.', 1)[1].lower() if '.' in filename_safe else 'bin'
+        if not allowed_file(f'dummy.{ext}'):
+            return jsonify({"message": "File type not allowed"}), 400
+
+        unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
+        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+
+        with open(filepath, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        relative_path = f'rfq_files/{unique_filename}'
+        return jsonify({
+            "status": "success",
+            "message": "File uploaded successfully.",
+            "file_path": relative_path,
+            "original_filename": filename_safe
+        }), 200
+
+    except requests.RequestException as e:
+        return jsonify({"message": f"Failed to fetch file: {e}"}), 502
+    except Exception as e:
+        return jsonify({"message": f"Server error saving file: {e}"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
