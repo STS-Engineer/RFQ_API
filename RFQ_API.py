@@ -42,8 +42,8 @@ CLIENT_DB_CONFIG = {
 app = Flask(__name__)
 
 # URL Configuration for Validation Workflow
-BASE_URL = "http://127.0.0.1:8000" 
-RFQ_SUBMISSION_API_URL = "http://127.0.0.1:8000/api/rfq/submit"
+BASE_URL = "https://rfq-api.azurewebsites.net" 
+RFQ_SUBMISSION_API_URL = "https://rfq-api.azurewebsites.net/api/rfq/submit"
 
 # Flask-Mail Configuration for Outlook SMTP (UNAUTHENTICATED RELAY)
 app.config['MAIL_SERVER'] = 'avocarbon-com.mail.protection.outlook.com'
