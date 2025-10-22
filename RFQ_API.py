@@ -1418,7 +1418,7 @@ def submit_rfq_data():
     # Extract validation fields if present
     final_status = data.pop('status', None) 
     final_validator_comments = data.pop('validator_comments', None)
-    created_by_email = data.pop('created_by_by_email', None)
+    created_by_email = data.pop('created_by_email', None)
     validated_by_email = data.pop('validated_by_email', None)
     rfq_file_path = data.pop('rfq_file_path', None)
     # Normalize status from list to string if needed
