@@ -2280,6 +2280,157 @@ def upload_file():
     except Exception as e:
         return jsonify({"message": f"Server error saving file: {e}"}), 500
 
+
+
+
+@app.route('/api/rfq/update/<string:rfq_id>', methods=['PUT'])
+def update_rfq(rfq_id):
+    """
+    Updates an existing RFQ record in the 'main' table using its rfq_id.
+    This expects the FULL RFQ object, similar to the /submit endpoint.
+    """
+    data = request.get_json()
+    conn = None
+    
+    if not data:
+        return jsonify({"status": "error", "message": "No data provided"}), 400
+
+    try:
+        conn, cursor = get_db()
+        
+        # --- 1. Check if RFQ exists and get original contact_id_fk ---
+        cursor.execute("SELECT contact_id_fk FROM main WHERE rfq_id = %s", (rfq_id,))
+        existing_rfq = cursor.fetchone()
+        
+        if not existing_rfq:
+            return jsonify({"status": "error", "message": f"RFQ ID {rfq_id} not found."}), 404
+        
+        original_contact_id_fk = existing_rfq['contact_id_fk']
+
+        # --- 2. Handle Contact (Get or Create) ---
+        contact_id_fk = None
+        contact_data = data.pop('contact', {})
+        contact_email = contact_data.get('email')
+
+        if contact_email:
+            # If contact email is provided, get or create new contact
+            cursor.execute(
+                "SELECT contact_id FROM contact WHERE contact_email = %s", 
+                (contact_email,)
+            )
+            existing_contact = cursor.fetchone()
+
+            if existing_contact:
+                contact_id_fk = existing_contact['contact_id']
+            else:
+                insert_contact_sql = """
+                INSERT INTO contact (contact_role, contact_email, contact_phone)
+                VALUES (%s, %s, %s)
+                RETURNING contact_id;
+                """
+                cursor.execute(
+                    insert_contact_sql,
+                    (
+                        contact_data.get('role'),
+                        contact_data.get('email'),
+                        contact_data.get('phone')
+                    )
+                )
+                contact_id_fk = cursor.fetchone()['contact_id']
+        else:
+            # If no contact info provided in update, re-use the original contact ID
+            contact_id_fk = original_contact_id_fk
+
+        # --- 3. Extract validation/special fields ---
+        # (Using data.get() allows these fields to be in the payload or not)
+        final_status = data.get('status')
+        final_validator_comments = data.get('validator_comments')
+        created_by_email = data.get('created_by_email')
+        validated_by_email = data.get('validated_by_email')
+        rfq_file_path = data.get('rfq_file_path')
+
+        if isinstance(final_status, list) and final_status:
+            final_status = final_status[0]
+            
+        def get_numeric(key):
+            val = data.get(key)
+            return val if val != '' else None
+
+        # --- 4. Build column list and value list (must match /submit) ---
+        COLUMN_NAMES = [
+            'customer_name', 'application', 'product_line', 'customer_pn', 'revision_level',
+            'delivery_zone', 'delivery_plant', 'sop_year', 'annual_volume', 'rfq_reception_date',
+            'quotation_expected_date', 'target_price_eur', 'delivery_conditions', 'payment_terms',
+            'business_trigger', 'entry_barriers', 'product_feasibility_note', 'manufacturing_location',
+            'risks', 'decision', 'design_responsibility', 'validation_responsibility', 'design_ownership',
+            'development_costs', 'technical_capacity', 'scope_alignment', 'overall_feasibility',
+            'customer_status', 'strategic_note', 'final_recommendation', 'contact_id_fk', 
+            'validator_comments', 'status', 'created_by_email', 'validated_by_email', 'rfq_file_path'
+        ]
+
+        main_values = [
+            data.get('customer_name'), data.get('application'), data.get('product_line'), 
+            data.get('customer_pn'), data.get('revision_level'),
+            data.get('delivery_zone'), data.get('delivery_plant'), 
+            get_numeric('sop_year'), get_numeric('annual_volume'), 
+            data.get('rfq_reception_date'), data.get('quotation_expected_date'), 
+            get_numeric('target_price_eur'), 
+            data.get('delivery_conditions'), data.get('payment_terms'), data.get('business_trigger'), 
+            data.get('entry_barriers'), data.get('product_feasibility_note'), 
+            data.get('manufacturing_location'), data.get('risks'), data.get('decision'), 
+            data.get('design_responsibility'), data.get('validation_responsibility'), 
+            data.get('design_ownership'), data.get('development_costs'), 
+            convert_to_boolean(data.get('technical_capacity')), convert_to_boolean(data.get('scope_alignment')), 
+            data.get('overall_feasibility'), data.get('customer_status'), data.get('strategic_note'), 
+            data.get('final_recommendation'), 
+            contact_id_fk, 
+            final_validator_comments, final_status, created_by_email, validated_by_email, rfq_file_path
+        ]
+
+        # --- 5. Construct and Execute UPDATE statement ---
+        set_clause = ", ".join([f"{col} = %s" for col in COLUMN_NAMES])
+        
+        update_main_sql = f"UPDATE main SET {set_clause} WHERE rfq_id = %s"
+
+        # Add the rfq_id to the end of the values list for the WHERE clause
+        query_values = main_values + [rfq_id]
+        
+        cursor.execute(update_main_sql, tuple(query_values))
+        
+        conn.commit()
+
+        return jsonify({
+            "status": "success", 
+            "message": "RFQ data successfully updated.", 
+            "rfq_id": rfq_id
+        }), 200
+
+    except ConnectionError as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+    except OperationalError as e:
+        if conn:
+            conn.rollback()
+        pg_error_message = getattr(e, 'pgerror', None)
+        detail_message = pg_error_message.strip() if pg_error_message else str(e)
+        return jsonify({
+            "status": "error",
+            "message": f"Database update failed (PostgreSQL Error): {detail_message}",
+            "rfq_id": rfq_id
+        }), 500
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({"status": "error", "message": f"An unexpected error occurred: {e}"}), 500
+    finally:
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
+
+
+
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False)
