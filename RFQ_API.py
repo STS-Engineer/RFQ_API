@@ -2271,8 +2271,8 @@ def upload_file():
         
         # --- 🔒 SECURE: Load secrets from environment ---
         token = os.environ.get('GITHUB_TOKEN')
-        repo_full_name = os.environ.get('GITHUB_REPO')
-        branch = os.environ.get('GITHUB_BRANCH', 'main')
+        repo_full_name = "STS-Engineer/RFQ-back"
+        branch = "main"
 
         if not token or not repo_full_name:
             app.logger.error("GitHub configuration (GITHUB_TOKEN, GITHUB_REPO) is missing.")
