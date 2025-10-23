@@ -2270,7 +2270,7 @@ def upload_file():
         # --- 3. GitHub Upload Logic ---
         
         # --- 🔒 SECURE: Load secrets from environment ---
-        token = "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"
+        token = "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"
         repo_full_name = "STS-Engineer/RFQ-back" # e.g., "STS-Engineer/RFQ-back"
         branch = "main"
 
