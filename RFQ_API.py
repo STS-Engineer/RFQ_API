@@ -2226,81 +2226,23 @@ def check_groupe_existence():
 
 # ======================== FILE UPLOAD ENDPOINT ========================
 
+
+
+
+
 @app.route('/api/upload-file', methods=['POST'])
 def upload_file():
-    app.logger.info(f"Content-Type: {request.content_type}")
-    app.logger.info(f"Files: {request.files}")
-    app.logger.info(f"Form: {request.form}")
-    
-    # Check if file is in request.files (standard file upload)
-    if 'file' in request.files:
-        file = request.files['file']
-        
-        if file.filename == '':
-            return jsonify({"message": "No file selected"}), 400
-        
-        if not allowed_file(file.filename):
-            return jsonify({"message": "File type not allowed"}), 400
-        
-        try:
-            # Read file content
-            file_content_bytes = file.read()
-            original_name = secure_filename(file.filename)
-            ext = original_name.rsplit('.', 1)[1].lower() if '.' in original_name else 'bin'
-            
-            # GitHub upload logic (same as before)
-            token = "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"
-            repo_full_name = "STS-Engineer/RFQ-back"
-            branch = "main"
-            
-            unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
-            file_path_in_repo = f"uploads/{unique_filename}"
-            
-            content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
-            
-            api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
-            
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.v3+json",
-            }
-            
-            payload = {
-                "message": f"Upload RFQ file: {unique_filename}",
-                "content": content_b64,
-                "branch": branch
-            }
-            
-            put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
-            put_response.raise_for_status()
-            
-            response_json = put_response.json()
-            raw_url = response_json['content']['download_url']
-            
-            return jsonify({
-                "status": "success",
-                "message": "File uploaded successfully to GitHub.",
-                "file_path": raw_url,
-                "original_filename": original_name
-            }), 200
-            
-        except Exception as e:
-            app.logger.error(f"Upload failed: {e}")
-            return jsonify({"message": f"Upload failed: {e}"}), 500
-    
-    # Fallback: Try openaiFileIdRefs format (for GPT Actions that support it)
+    # This is the "old approach" that the Assistant uses
     data = request.get_json(silent=True) or {}
     refs = data.get('openaiFileIdRefs', [])
     
     if not refs:
         return jsonify({
-            "message": "No file found. Send either: 1) multipart/form-data with 'file' field, or 2) JSON with openaiFileIdRefs",
-            "received_content_type": request.content_type,
-            "has_files": bool(request.files),
-            "has_json": request.is_json
+            "message": "No openaiFileIdRefs in JSON request",
+            "received_content_type": request.content_type
         }), 400
     
-    # Original openaiFileIdRefs logic here...
+    # --- Original openaiFileIdRefs logic ---
     first = refs[0]
     if isinstance(first, dict):
         download_link = first.get('download_link')
@@ -2313,23 +2255,32 @@ def upload_file():
         return jsonify({"message": "Missing download_link in openaiFileIdRefs"}), 400
     
     try:
+        # 1. Download the file from the temporary link
         r = requests.get(download_link, stream=False, timeout=10)
         r.raise_for_status()
         file_content_bytes = r.content
         
+        # 2. Check file type
         filename_safe = secure_filename(original_name)
         ext = filename_safe.rsplit('.', 1)[1].lower() if '.' in filename_safe else 'bin'
         
         if not allowed_file(f'dummy.{ext}'):
             return jsonify({"message": "File type not allowed"}), 400
         
-        # Same GitHub upload logic...
-        token = "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"
-        repo_full_name = "STS-Engineer/RFQ-back"
-        branch = "main"
+        # --- 3. GitHub Upload Logic ---
         
+        # --- 🔒 SECURE: Load secrets from environment ---
+        token = "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"
+        repo_full_name = "STS-Engineer/RFQ-back" # e.g., "STS-Engineer/RFQ-back"
+        branch = "main"
+
+        if not token or not repo_full_name:
+            app.logger.error("GitHub configuration (GITHUB_TOKEN, GITHUB_REPO) is missing.")
+            return jsonify({"message": "Server configuration error: GitHub token/repo not set"}), 500
+        
+        # 4. Prepare file for GitHub API
         unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
-        file_path_in_repo = f"uploads/{unique_filename}"
+        file_path_in_repo = f"uploads/{unique_filename}" # Using 'uploads/' folder
         content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
         
         api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
@@ -2343,6 +2294,7 @@ def upload_file():
             "branch": branch
         }
         
+        # 5. Upload to GitHub
         put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
         put_response.raise_for_status()
         response_json = put_response.json()
@@ -2351,13 +2303,19 @@ def upload_file():
         return jsonify({
             "status": "success",
             "message": "File uploaded successfully to GitHub.",
-            "file_path": raw_url,
+            "file_path": raw_url, # This is the permanent download link
             "original_filename": filename_safe
         }), 200
         
+    except requests.RequestException as e:
+        app.logger.error(f"Failed to download file from link: {e}")
+        return jsonify({"message": f"Failed to download file: {e}"}), 502
     except Exception as e:
-        app.logger.error(f"Download/upload failed: {e}")
-        return jsonify({"message": f"Operation failed: {e}"}), 502
+        app.logger.error(f"GitHub upload failed: {e}")
+        return jsonify({"message": f"Operation failed: {e}"}), 500
+
+
+
   
 
 
