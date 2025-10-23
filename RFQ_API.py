@@ -2283,7 +2283,7 @@ def upload_file():
 
 
 
-@app.route('/api/rfq/update/<string:rfq_id>', methods=['PUT'])
+@app.route('/api/rfq/update/<string:rfq_id>', methods=['POST', 'PUT'])
 def update_rfq(rfq_id):
     """
     Updates an existing RFQ record in the 'main' table using its rfq_id.
@@ -2348,6 +2348,7 @@ def update_rfq(rfq_id):
         created_by_email = data.get('created_by_email')
         validated_by_email = data.get('validated_by_email')
         rfq_file_path = data.get('rfq_file_path')
+        # Note: 'updated_by' will be fetched directly in the values list below
 
         if isinstance(final_status, list) and final_status:
             final_status = final_status[0]
@@ -2365,7 +2366,8 @@ def update_rfq(rfq_id):
             'risks', 'decision', 'design_responsibility', 'validation_responsibility', 'design_ownership',
             'development_costs', 'technical_capacity', 'scope_alignment', 'overall_feasibility',
             'customer_status', 'strategic_note', 'final_recommendation', 'contact_id_fk', 
-            'validator_comments', 'status', 'created_by_email', 'validated_by_email', 'rfq_file_path'
+            'validator_comments', 'status', 'created_by_email', 'validated_by_email', 'rfq_file_path',
+            'updated_by'  
         ]
 
         main_values = [
@@ -2384,7 +2386,8 @@ def update_rfq(rfq_id):
             data.get('overall_feasibility'), data.get('customer_status'), data.get('strategic_note'), 
             data.get('final_recommendation'), 
             contact_id_fk, 
-            final_validator_comments, final_status, created_by_email, validated_by_email, rfq_file_path
+            final_validator_comments, final_status, created_by_email, validated_by_email, rfq_file_path,
+            data.get('updated_by') 
         ]
 
         # --- 5. Construct and Execute UPDATE statement ---
@@ -2426,6 +2429,7 @@ def update_rfq(rfq_id):
             cursor.close()
         if conn:
             conn.close()
+
 
 
 
