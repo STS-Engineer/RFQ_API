@@ -959,14 +959,8 @@ def send_report_for_validation():
     # leading slashes from the stored path and ensuring only one slash separates BASE_URL.
     file_display = ""
     if rfq_file_path:
-        # 💡 FIX: Safely combine BASE_URL and the stored relative path.
-        # 1. Clean the stored path of any potential leading slashes/whitespace.
-        cleaned_path = rfq_file_path.strip().lstrip('/') 
-        
-        # 2. Combine BASE_URL (e.g., http://127.0.0.1:8000) with the cleaned path (e.g., rfq_files/filename.pdf)
-        file_url = f"{BASE_URL.rstrip('/')}/{cleaned_path}" 
-        
-        file_display = f'<p style="margin-top: 15px;"><strong>Attached Document:</strong> <a href="{file_url}" target="_blank">View RFQ File</a></p>'
+        file_url = rfq_file_path
+        file_display = f'<p style="margin-top: 15px;"><strong>Attached Document:</strong> <a href="{file_url}" target="_blank">View Drawing File</a></p>'
     # << END MODIFICATION
 
     # 4. Construct Email
