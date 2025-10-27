@@ -960,7 +960,7 @@ def send_report_for_validation():
     file_display = ""
     if rfq_file_path:
         file_url = rfq_file_path
-        file_display = f'<p style="margin-top: 15px;"><strong>Attached Document:</strong> <a href="{file_url}" target="_blank">View Drawing File</a></p>'
+        file_display = f'<p style="margin-top: 15px;"><strong>Attached Document:</strong> <a href="{file_url}" target="_blank">Download Drawing File</a></p>'
     # << END MODIFICATION
 
     # 4. Construct Email
