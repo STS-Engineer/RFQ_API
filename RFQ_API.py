@@ -1045,15 +1045,31 @@ def validate_page():
     else:
         return "Error: Invalid action specified.", 400
 
+    
+    rfq_file_path = request_data.get('rfq_file_path')
+    file_embed_html = ""
+    if rfq_file_path and rfq_file_path.startswith('http'):
+        file_embed_html = f"""
+        <h2 style="margin-top: 30px;">Attached RFQ Document</h2>
+        <div style="margin-bottom: 25px; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; height: 600px; width: 100%;">
+            <iframe src="{rfq_file_path}" style="width: 100%; height: 100%; border: none;"></iframe>
+        </div>
+        """
+
     html_content = f"""
     <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title}</title>
         <style>body {{ font-family: 'Inter', sans-serif; margin: 0; padding: 20px; background-color: #f4f4f4; }} .container {{ max-width: 800px; margin: 0 auto; background-color: #ffffff; padding: 25px; border-radius: 12px; box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15); }} h1 {{ color: {color}; text-align: center; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-bottom: 25px; }} .report-box {{ background-color: #f0f8ff; border: 1px solid #cceeff; padding: 15px; border-radius: 8px; margin-bottom: 20px; white-space: pre-wrap; font-family: monospace; font-size: 0.95em; }} label {{ display: block; margin-bottom: 10px; font-weight: bold; color: #333; }} textarea {{ width: 100%; padding: 12px; box-sizing: border-box; border: 2px solid #ccc; border-radius: 6px; resize: vertical; min-height: 150px; transition: border-color 0.3s; }} textarea:focus {{ border-color: #007acc; outline: none; }} .submit-btn {{ background-color: {color}; color: white; padding: 14px 25px; border: none; border-radius: 6px; cursor: pointer; font-size: 17px; font-weight: bold; width: 100%; margin-top: 20px; transition: background-color 0.3s, transform 0.1s; }} .submit-btn:hover {{ opacity: 0.9; transform: translateY(-1px); }} @media (max-width: 600px) {{ .container {{ padding: 15px; }} h1 {{ font-size: 1.5em; }} }}</style>
     </head>
-    <body><div class="container"><h1>{title}</h1><h2>AI Report Content</h2><div class="report-box">{report_content}</div>
-            <form action="/api/handle-validation" method="post"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="action" value="{action}">
-                <label for="comments">Validator Comments (Required for final decision):</label><textarea id="comments" name="comments" placeholder="Enter comments regarding your decision..." required></textarea>
-                <button type="submit" class="submit-btn">{action_text} and Submit to Database</button>
-            </form><p style="text-align: center; margin-top: 30px;"><small>Report ID: {request_id}</small></p></div></body></html>"""
+    <body><div class="container">
+        <h1>{title}</h1>
+        
+        {file_embed_html} <h2>AI Report Content</h2>
+        <div class="report-box">{report_content}</div>
+        
+        <form action="/api/handle-validation" method="post"><input type="hidden" name="request_id" value="{request_id}"><input type="hidden" name="action" value="{action}">
+            <label for="comments">Validator Comments (Required for final decision):</label><textarea id="comments" name="comments" placeholder="Enter comments regarding your decision..." required></textarea>
+            <button type="submit" class="submit-btn">{action_text} and Submit to Database</button>
+        </form><p style="text-align: center; margin-top: 30px;"><small>Report ID: {request_id}</small></p></div></body></html>"""
     return html_content
 
 
@@ -2292,12 +2308,12 @@ def upload_file():
         put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
         put_response.raise_for_status()
         response_json = put_response.json()
-        github_view_url = response_json['content']['html_url']
+        raw_url = response_json['content']['download_url']
         
         return jsonify({
             "status": "success",
             "message": "File uploaded successfully to GitHub.",
-            "file_path": github_view_url, # This is the permanent download link
+            "file_path": raw_url, # This is the permanent download link
             "original_filename": filename_safe
         }), 200
         
