@@ -2292,12 +2292,12 @@ def upload_file():
         put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
         put_response.raise_for_status()
         response_json = put_response.json()
-        raw_url = response_json['content']['download_url']
+        github_view_url = response_json['content']['html_url']
         
         return jsonify({
             "status": "success",
             "message": "File uploaded successfully to GitHub.",
-            "file_path": raw_url, # This is the permanent download link
+            "file_path": github_view_url, # This is the permanent download link
             "original_filename": filename_safe
         }), 200
         
