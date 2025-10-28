@@ -1049,10 +1049,12 @@ def validate_page():
     rfq_file_path = request_data.get('rfq_file_path')
     file_embed_html = ""
     if rfq_file_path and rfq_file_path.startswith('http'):
+        proxy_url = f"{BASE_URL}/api/file/view?url={rfq_file_path}"
+
         file_embed_html = f"""
         <h2 style="margin-top: 30px;">Attached RFQ Document</h2>
         <div style="margin-bottom: 25px; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; height: 600px; width: 100%;">
-            <iframe src="{rfq_file_path}" style="width: 100%; height: 100%; border: none;"></iframe>
+            <iframe src="{proxy_url}" style="width: 100%; height: 100%; border: none;" allowfullscreen></iframe>
         </div>
         """
 
@@ -2477,6 +2479,45 @@ def update_rfq(rfq_id):
         if conn:
             conn.close()
 
+
+@app.route('/api/file/view', methods=['GET'])
+def file_viewer_proxy():
+    """
+    Proxies a file from a remote URL (GitHub Raw URL) and serves it with 
+    appropriate headers to force browser display (inline) instead of download.
+    """
+    file_url = request.args.get('url')
+    if not file_url or not file_url.startswith('http'):
+        return "Invalid or missing file URL.", 400
+
+    try:
+        # 1. Fetch the file content from the remote URL (GitHub)
+        # We use stream=True for efficiency, but fetch all content before returning the response
+        response = requests.get(file_url, timeout=30) 
+        response.raise_for_status()
+
+        # 2. Get original file extension/name (simple extraction from URL)
+        original_filename = file_url.split('/')[-1].split('?')[0]
+        
+        # 3. Create a Flask response object with the content
+        flask_response = app.response_class(
+            response=response.content,
+            status=response.status_code,
+            # Copy content type from GitHub response (e.g., application/pdf)
+            mimetype=response.headers.get('Content-Type', 'application/octet-stream') 
+        )
+
+        # 4. CRITICAL STEP: Set Content-Disposition header to 'inline'
+        #    This tells the browser to display the content inline.
+        flask_response.headers['Content-Disposition'] = f'inline; filename="{original_filename}"'
+        flask_response.headers['X-Content-Type-Options'] = 'nosniff' # Security
+        
+        return flask_response
+
+    except requests.exceptions.HTTPError as e:
+        return f"Error fetching file from source: {e}", e.response.status_code
+    except Exception as e:
+        return f"An unexpected proxy error occurred: {e}", 500
 
 
 
