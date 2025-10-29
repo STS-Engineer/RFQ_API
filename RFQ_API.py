@@ -2231,6 +2231,8 @@ def check_groupe_existence():
 
 
 
+
+
 @app.route('/api/upload-file', methods=['POST'])
 def upload_file():
     # This is the "old approach" that the Assistant uses
@@ -2257,6 +2259,7 @@ def upload_file():
     
     try:
         # 1. Download the file from the temporary link
+        app.logger.info(f"Downloading file from: {download_link}")
         r = requests.get(download_link, stream=False, timeout=10)
         r.raise_for_status()
         file_content_bytes = r.content
@@ -2270,10 +2273,11 @@ def upload_file():
         
         # --- 3. GitHub Upload Logic ---
         
-        # --- 🔒 SECURE: Load secrets from environment ---
+        # --- 🔒 SECURE: Load secrets from configuration ---
         token = os.environ.get('GITHUB_TOKEN')
         repo_full_name = "STS-Engineer/RFQ-back"
         branch = "main"
+
 
         if not token or not repo_full_name:
             app.logger.error("GitHub configuration (GITHUB_TOKEN, GITHUB_REPO) is missing.")
@@ -2281,7 +2285,9 @@ def upload_file():
         
         # 4. Prepare file for GitHub API
         unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
-        file_path_in_repo = f"uploads/{unique_filename}" # Using 'uploads/' folder
+        # file_path_in_repo is the exact path (uploads/filename.ext)
+        file_path_in_repo = f"uploads/{unique_filename}" 
+        
         content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
         
         api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
@@ -2296,26 +2302,36 @@ def upload_file():
         }
         
         # 5. Upload to GitHub
+        app.logger.info(f"Attempting upload to GitHub at path: {file_path_in_repo}")
         put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
         put_response.raise_for_status()
         response_json = put_response.json()
-        raw_url = response_json['content']['download_url']
+        
+        # The full raw URL is available here, but we don't need it.
+        # raw_url = response_json['content']['download_url'] 
+
+        # --- MODIFICATION START ---
+        # Construct the needed path: /uploads/rfq_upload_...
+        needed_path = '/' + file_path_in_repo
+        # --- MODIFICATION END ---
         
         return jsonify({
             "status": "success",
             "message": "File uploaded successfully to GitHub.",
-            "file_path": raw_url, # This is the permanent download link
+            # Return the extracted path, which starts with /uploads/
+            "file_path": needed_path, 
             "original_filename": filename_safe
         }), 200
         
     except requests.RequestException as e:
-        app.logger.error(f"Failed to download file from link: {e}")
-        return jsonify({"message": f"Failed to download file: {e}"}), 502
+        app.logger.error(f"Request failed (download or upload): {e}")
+        error_message = f"Failed to process file request: {e}"
+        if hasattr(e, 'response') and e.response is not None:
+             error_message += f" (Status: {e.response.status_code}, Response: {e.response.text[:100]}...)"
+        return jsonify({"message": error_message}), 502
     except Exception as e:
-        app.logger.error(f"GitHub upload failed: {e}")
+        app.logger.error(f"General operation failed: {e}")
         return jsonify({"message": f"Operation failed: {e}"}), 500
-
-
 
   
 
