@@ -918,6 +918,11 @@ def health():
 
 # ======================== VALIDATION WORKFLOW ENDPOINTS ========================
 
+
+
+
+
+
 @app.route('/api/send-report', methods=['POST', 'PUT'])
 def send_report_for_validation():
     """Sends AI report for validation via email."""
@@ -959,8 +964,11 @@ def send_report_for_validation():
     # leading slashes from the stored path and ensuring only one slash separates BASE_URL.
     file_display = ""
     if rfq_file_path:
-        file_url = rfq_file_path
-        file_display = f'<p style="margin-top: 15px;"><strong>Attached Document:</strong> <a href="{file_url}" target="_blank">Download Drawing File</a></p>'
+        path_in_repo = rfq_file_path.lstrip('/') 
+        # Reconstruct the full raw content URL using the global configuration
+        file_url = f"https://raw.githubusercontent.com/STS-Engineer/RFQ-back/main/{path_in_repo}"
+
+        file_display = f'<p style="margin-top: 15px;"><strong>Attached Document:</strong> <a href="{file_url}" target="_blank">Download RFQ File</a></p>'
     # << END MODIFICATION
 
     # 4. Construct Email
@@ -984,6 +992,17 @@ def send_report_for_validation():
 
     print(f"DEBUG: Validation request created with ID: {request_id}")
     return jsonify({"message": "Validation email sent successfully.", "request_id": request_id, "rfq_file_path": rfq_file_path}), 200
+
+
+
+
+
+
+
+
+
+
+
 
 @app.route('/validate-page')
 def validate_page():
