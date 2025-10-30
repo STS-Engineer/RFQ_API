@@ -1999,6 +1999,8 @@ def check_contact_existence():
             conn.close()
 
 
+
+
 @app.route('/api/data/ingest', methods=['POST'])
 def data_ingestion():
     """
@@ -2066,19 +2068,22 @@ def data_ingestion():
             assistant_person_id = existing_assistant['Person_id']
             assistant_status = "EXISTING"
         else:
-            # Get next ID for Person table
-            cursor.execute('SELECT COALESCE(MAX("Person_id"), 0) + 1 AS next_id FROM public."Person";')
-            result = cursor.fetchone()
-            assistant_person_id = result['next_id'] if result else 1
-            
+            # --- FIXED: Removed manual ID generation. Added RETURNING "Person_id". ---
+            # Note: Preserved quoted "role" column name.
             insert_assistant_sql = '''
-                INSERT INTO public."Person" ("Person_id", first_name, last_name, job_title, email, phone_number, role, zone_name) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO public."Person" (first_name, last_name, job_title, email, phone_number, "role", zone_name) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING "Person_id";
             '''
             cursor.execute(insert_assistant_sql, (
-                assistant_person_id, assistant_first_name, assistant_last_name, 
-                assistant_job_title, assistant_email, None, 'Commercial', delivery_zone
+                assistant_first_name, assistant_last_name, assistant_job_title, 
+                assistant_email, None, 'Commercial', delivery_zone
             ))
+            result = cursor.fetchone()
+            if not result:
+                raise Exception("Failed to create new assistant person, no ID returned.")
+            assistant_person_id = result['Person_id']
+            # --- END FIX ---
             assistant_status = "NEW"
 
         # --- 1. Groupe/Customer Ingestion ---
@@ -2090,13 +2095,18 @@ def data_ingestion():
             groupe_id = existing_groupe['groupe_id']
             groupe_status = "EXISTING"
         else:
-            # Get next ID for groupe table
-            cursor.execute('SELECT COALESCE(MAX(groupe_id), 0) + 1 AS next_id FROM public.groupe;')
+            # --- FIXED: Removed manual ID generation. Added RETURNING groupe_id. ---
+            insert_groupe_sql = """
+                INSERT INTO public.groupe (groupe_name) 
+                VALUES (%s) 
+                RETURNING groupe_id;
+            """
+            cursor.execute(insert_groupe_sql, (customer_name,))
             result = cursor.fetchone()
-            groupe_id = result['next_id'] if result else 1
-            
-            insert_groupe_sql = "INSERT INTO public.groupe (groupe_id, groupe_name) VALUES (%s, %s);"
-            cursor.execute(insert_groupe_sql, (groupe_id, customer_name))
+            if not result:
+                raise Exception("Failed to create new groupe, no ID returned.")
+            groupe_id = result['groupe_id']
+            # --- END FIX ---
             groupe_status = "NEW"
 
         # --- 2. Unit/Plant Ingestion ---
@@ -2113,13 +2123,20 @@ def data_ingestion():
             update_unit_sql = "UPDATE public.unit SET com_person_id = %s WHERE unit_id = %s;"
             cursor.execute(update_unit_sql, (assistant_person_id, unit_id))
         else:
-            # Get next ID for unit table
-            cursor.execute('SELECT COALESCE(MAX(unit_id), 0) + 1 AS next_id FROM public.unit;')
+            # --- FIXED: Removed manual ID generation. Added RETURNING unit_id. ---
+            insert_unit_sql = """
+                INSERT INTO public.unit (groupe_id, unit_name, city, country, zone_name, com_person_id) 
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING unit_id;
+            """
+            cursor.execute(insert_unit_sql, (
+                groupe_id, plant_name, city, country, delivery_zone, assistant_person_id
+            ))
             result = cursor.fetchone()
-            unit_id = result['next_id'] if result else 1
-            
-            insert_unit_sql = "INSERT INTO public.unit (unit_id, groupe_id, unit_name, city, country, zone_name, com_person_id) VALUES (%s, %s, %s, %s, %s, %s, %s);"
-            cursor.execute(insert_unit_sql, (unit_id, groupe_id, plant_name, city, country, delivery_zone, assistant_person_id))
+            if not result:
+                raise Exception("Failed to create new unit, no ID returned.")
+            unit_id = result['unit_id']
+            # --- END FIX ---
             unit_status = "NEW"
             
         # --- 3. RFQ Contact Person Ingestion (Must be separate from Assistant Person) ---
@@ -2131,20 +2148,22 @@ def data_ingestion():
             person_id = existing_person['Person_id']
             person_status = "EXISTING"
         else:
-            # Get next ID for Person table
-            cursor.execute('SELECT COALESCE(MAX("Person_id"), 0) + 1 AS next_id FROM public."Person";')
-            result = cursor.fetchone()
-            person_id = result['next_id'] if result else 1
-            
+            # --- FIXED: Removed manual ID generation. Added RETURNING "Person_id". ---
             # Note: factory_id in Person table maps to unit_id
             insert_person_sql = '''
-                INSERT INTO public."Person" ("Person_id", factory_id, first_name, last_name, job_title, email, phone_number, role, zone_name) 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO public."Person" (factory_id, first_name, last_name, job_title, email, phone_number, "role", zone_name) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING "Person_id";
             '''
             cursor.execute(insert_person_sql, (
-                person_id, unit_id, contact_first_name, contact_last_name, 
+                unit_id, contact_first_name, contact_last_name, 
                 contact_job_title, contact_email, contact_phone, contact_role, delivery_zone
             ))
+            result = cursor.fetchone()
+            if not result:
+                raise Exception("Failed to create new contact person, no ID returned.")
+            person_id = result['Person_id']
+            # --- END FIX ---
             person_status = "NEW"
 
         conn.commit()
@@ -2180,6 +2199,10 @@ def data_ingestion():
         if conn:
             cursor.close()
             conn.close()
+
+
+
+
 
 
 @app.route('/api/data/groupe/check', methods=['GET'])
