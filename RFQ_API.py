@@ -1497,6 +1497,7 @@ def submit_rfq_data():
             'risks', 'decision', 'design_responsibility', 'validation_responsibility', 'design_ownership',
             'development_costs', 'technical_capacity', 'scope_alignment', 'overall_feasibility',
             'customer_status', 'strategic_note', 'final_recommendation', 'contact_id_fk', 
+            'requester_comment', # <--- NEW
             'validator_comments', 'status','created_by_email', 'validated_by_email','rfq_file_path'
         ]
 
@@ -1516,6 +1517,7 @@ def submit_rfq_data():
             data.get('overall_feasibility'), data.get('customer_status'), data.get('strategic_note'), 
             data.get('final_recommendation'), 
             contact_id_fk, 
+            data.get('requester_comment'), # <--- NEW
             final_validator_comments, final_status,created_by_email, validated_by_email,rfq_file_path
         ]
 
@@ -2454,8 +2456,9 @@ def update_rfq(rfq_id):
             'risks', 'decision', 'design_responsibility', 'validation_responsibility', 'design_ownership',
             'development_costs', 'technical_capacity', 'scope_alignment', 'overall_feasibility',
             'customer_status', 'strategic_note', 'final_recommendation', 'contact_id_fk', 
+            'requester_comment', # <--- NEW
             'validator_comments', 'status', 'created_by_email', 'validated_by_email', 'rfq_file_path',
-            'updated_by'  
+            'updated_by' 
         ]
 
         main_values = [
@@ -2474,6 +2477,7 @@ def update_rfq(rfq_id):
             data.get('overall_feasibility'), data.get('customer_status'), data.get('strategic_note'), 
             data.get('final_recommendation'), 
             contact_id_fk, 
+            data.get('requester_comment'), # <--- NEW
             final_validator_comments, final_status, created_by_email, validated_by_email, rfq_file_path,
             data.get('updated_by') 
         ]
