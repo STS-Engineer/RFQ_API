@@ -28,7 +28,7 @@ ALLOW_HEADER_OVERRIDE = os.environ.get("ALLOW_HEADER_OVERRIDE", "true").lower() 
 # PostgreSQL configuration
 DB_CONFIG = {
     "host": "avo-adb-002.postgres.database.azure.com",
-    "database": "RFQ_DATA",
+    "database": "Costing_DB",
     "user": "administrationSTS",
     "password": "St$@0987"
 }
