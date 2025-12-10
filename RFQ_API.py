@@ -14,7 +14,7 @@ from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify, send_from_directory
 from flask_mail import Mail, Message
 from werkzeug.utils import secure_filename
-
+from decimal import Decimal
 
 
 
@@ -2523,6 +2523,64 @@ def update_rfq(rfq_id):
             conn.close()
 
 
+
+@app.route('/api/rfq/update-request/<string:rfq_id>', methods=['GET'])
+def get_rfq_update_request_data(rfq_id):
+    """
+    Retrieves data from rfq_update_requests table for a specific RFQ ID.
+    Returns a list of requests sorted by creation date (newest first).
+    """
+    conn = None
+    try:
+        conn, cursor = get_db()
+
+        # Query to fetch all columns
+        query = """
+            SELECT * FROM public.rfq_update_requests 
+            WHERE rfq_id = %s 
+            ORDER BY created_at DESC
+        """
+        
+        cursor.execute(query, (rfq_id,))
+        results = cursor.fetchall()
+
+        if not results:
+            return jsonify({
+                "status": "success",
+                "message": f"No update requests found for RFQ ID: {rfq_id}",
+                "data": []
+            }), 200
+
+        # Helper function to serialize SQL types (DateTime, Decimal) to JSON-friendly formats
+        def serialize_row(row):
+            clean_row = dict(row)
+            for key, value in clean_row.items():
+                # Handle Timestamps and Dates
+                if isinstance(value, (datetime.date, datetime.datetime)):
+                    clean_row[key] = value.isoformat()
+                # Handle Numeric/Decimal types
+                elif isinstance(value, Decimal):
+                    clean_row[key] = float(value)
+            return clean_row
+
+        # Apply serialization to all fetched rows
+        formatted_data = [serialize_row(row) for row in results]
+
+        return jsonify({
+            "status": "success",
+            "count": len(formatted_data),
+            "data": formatted_data
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error", 
+            "message": f"An error occurred retrieving update requests: {str(e)}"
+        }), 500
+        
+    finally:
+        if conn:
+            conn.close()
 
 
 
