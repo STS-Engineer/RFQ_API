@@ -32,6 +32,12 @@ DB_CONFIG = {
     "user": "administrationSTS",
     "password": "St$@0987"
 }
+RFQ_DB_CONFIG = {
+    "host": "avo-adb-002.postgres.database.azure.com",
+    "database": "RFQ_DATA",
+    "user": "administrationSTS",
+    "password": "St$@0987"
+}
 CLIENT_DB_CONFIG = {
     "host": "avo-adb-002.postgres.database.azure.com",
     "database": "Client_DB", # Client/Organization data (Groupe, Unit, Person)
@@ -1837,7 +1843,8 @@ def retrieve_products_modified():
 
     conn = None
     try:
-        conn, cursor = get_db()
+        conn = psycopg2.connect(**RFQ_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         select_columns = """
             id, product_name, product_line, description, product_definition, 
@@ -1896,7 +1903,8 @@ def retrieve_product_line_modified():
 
     conn = None
     try:
-        conn, cursor = get_db()
+        conn = psycopg2.connect(**RFQ_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         query = """
             SELECT *
@@ -1934,7 +1942,8 @@ def list_product_lines():
     """
     conn = None
     try:
-        conn, cursor = get_db()
+        conn = psycopg2.connect(**RFQ_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         query = """
             SELECT id, name AS product_line_name, type_of_products AS description_snippet
@@ -1981,7 +1990,8 @@ def get_product_line_by_product_name():
     conn = None
     cursor = None
     try:
-        conn, cursor = get_db()
+        conn = psycopg2.connect(**RFQ_DB_CONFIG)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
 
         query = """
             SELECT 
