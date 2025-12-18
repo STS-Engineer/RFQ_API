@@ -71,7 +71,7 @@ if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-ALLOWED_EXTENSIONS = {'pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png', 'zip'}
+ALLOWED_EXTENSIONS = {'pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png', 'zip', 'xls', 'xlsx'}
 MAX_CONTENT_LENGTH = 16 * 1024 * 1024 # 16 Megabytes
 
 app.add_url_rule('/rfq_files/<path:filename>', 
@@ -963,18 +963,31 @@ def send_report_for_validation():
     confirm_link = f"{BASE_URL}/validate-page?id={request_id}&action=confirm"
     decline_link = f"{BASE_URL}/validate-page?id={request_id}&action=decline"
     update_link = f"{BASE_URL}/validate-page?id={request_id}&action=update"  # <--- NEW LINK
-    # >> MODIFIED: Include file link in email if present. The link is constructed 
-    # explicitly using the stored relative path (`rfq_file_path`) by removing any 
-    # leading slashes from the stored path and ensuring only one slash separates BASE_URL.
+    # 3. Create Interactive Links
+    # --- NEW FILE HANDLING LOGIC ---
     file_display = ""
-    if rfq_file_path:
-        path_in_repo = rfq_file_path.lstrip('/') 
-        # Reconstruct the full raw content URL using the global configuration
-        file_url = f"https://raw.githubusercontent.com/STS-Engineer/RFQ-back/main/{path_in_repo}"
+    
+    # Check if rfq_file_path is a list (new format) or string (old format)
+    paths_to_process = []
+    if isinstance(rfq_file_path, list):
+        paths_to_process = rfq_file_path
+    elif isinstance(rfq_file_path, str) and rfq_file_path:
+        paths_to_process = [rfq_file_path]
 
-        file_display = f'<p style="margin-top: 15px;"><strong>Attached Document:</strong> <a href="{file_url}" target="_blank">Download RFQ File</a></p>'
-    # << END MODIFICATION
-
+    if paths_to_process:
+        file_links = []
+        for idx, path in enumerate(paths_to_process):
+            # Clean path
+            path_in_repo = path.lstrip('/')
+            file_url = f"https://raw.githubusercontent.com/STS-Engineer/RFQ-back/main/{path_in_repo}"
+            
+            # Create a nice link, e.g., "Download File 1"
+            file_links.append(f'<a href="{file_url}" target="_blank">Download File {idx + 1}</a>')
+        
+        # Join links with a separator
+        links_html = " | ".join(file_links)
+        file_display = f'<p style="margin-top: 15px;"><strong>Attached Documents:</strong> {links_html}</p>'
+    # -------------------------------
     # 4. Construct Email
     email_body_html = f"""
     <html><body style="font-family: Arial, sans-serif; line-height: 1.6;">
@@ -2447,7 +2460,7 @@ def check_groupe_existence():
 
 @app.route('/api/upload-file', methods=['POST'])
 def upload_file():
-    # This is the "old approach" that the Assistant uses
+    # 1. Get the list of file references
     data = request.get_json(silent=True) or {}
     refs = data.get('openaiFileIdRefs', [])
     
@@ -2457,94 +2470,86 @@ def upload_file():
             "received_content_type": request.content_type
         }), 400
     
-    # --- Original openaiFileIdRefs logic ---
-    first = refs[0]
-    if isinstance(first, dict):
-        download_link = first.get('download_link')
-        original_name = first.get('name') or 'uploaded_file'
-    else:
-        download_link = first
-        original_name = 'uploaded_file'
-    
-    if not download_link:
-        return jsonify({"message": "Missing download_link in openaiFileIdRefs"}), 400
-    
-    try:
-        # 1. Download the file from the temporary link
-        app.logger.info(f"Downloading file from: {download_link}")
-        r = requests.get(download_link, stream=False, timeout=10)
-        r.raise_for_status()
-        file_content_bytes = r.content
-        
-        # 2. Check file type
-        filename_safe = secure_filename(original_name)
-        ext = filename_safe.rsplit('.', 1)[1].lower() if '.' in filename_safe else 'bin'
-        
-        if not allowed_file(f'dummy.{ext}'):
-            return jsonify({"message": "File type not allowed"}), 400
-        
-        # --- 3. GitHub Upload Logic ---
-        
-        # --- 🔒 SECURE: Load secrets from configuration ---
-        token = os.environ.get('GITHUB_TOKEN')
-        repo_full_name = "STS-Engineer/RFQ-back"
-        branch = "main"
+    # 2. Load Configuration
+    token = os.environ.get('GITHUB_TOKEN')
+    repo_full_name = "STS-Engineer/RFQ-back"
+    branch = "main"
 
+    if not token or not repo_full_name:
+        app.logger.error("GitHub configuration (GITHUB_TOKEN, GITHUB_REPO) is missing.")
+        return jsonify({"message": "Server configuration error: GitHub token/repo not set"}), 500
 
-        if not token or not repo_full_name:
-            app.logger.error("GitHub configuration (GITHUB_TOKEN, GITHUB_REPO) is missing.")
-            return jsonify({"message": "Server configuration error: GitHub token/repo not set"}), 500
-        
-        # 4. Prepare file for GitHub API
-        unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
-        # file_path_in_repo is the exact path (uploads/filename.ext)
-        file_path_in_repo = f"uploads/{unique_filename}" 
-        
-        content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
-        
-        api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        payload = {
-            "message": f"Upload RFQ file: {unique_filename}",
-            "content": content_b64,
-            "branch": branch
-        }
-        
-        # 5. Upload to GitHub
-        app.logger.info(f"Attempting upload to GitHub at path: {file_path_in_repo}")
-        put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
-        put_response.raise_for_status()
-        response_json = put_response.json()
-        
-        # The full raw URL is available here, but we don't need it.
-        # raw_url = response_json['content']['download_url'] 
+    uploaded_paths = []
+    errors = []
 
-        # --- MODIFICATION START ---
-        # Construct the needed path: /uploads/rfq_upload_...
-        needed_path = '/' + file_path_in_repo
-        # --- MODIFICATION END ---
-        
-        return jsonify({
-            "status": "success",
-            "message": "File uploaded successfully to GitHub.",
-            # Return the extracted path, which starts with /uploads/
-            "file_path": needed_path, 
-            "original_filename": filename_safe
-        }), 200
-        
-    except requests.RequestException as e:
-        app.logger.error(f"Request failed (download or upload): {e}")
-        error_message = f"Failed to process file request: {e}"
-        if hasattr(e, 'response') and e.response is not None:
-             error_message += f" (Status: {e.response.status_code}, Response: {e.response.text[:100]}...)"
-        return jsonify({"message": error_message}), 502
-    except Exception as e:
-        app.logger.error(f"General operation failed: {e}")
-        return jsonify({"message": f"Operation failed: {e}"}), 500
+    # 3. Loop through ALL files in the request
+    for file_ref in refs:
+        try:
+            # Handle dictionary vs string format
+            if isinstance(file_ref, dict):
+                download_link = file_ref.get('download_link')
+                original_name = file_ref.get('name') or 'uploaded_file'
+            else:
+                download_link = file_ref
+                original_name = 'uploaded_file'
 
+            if not download_link:
+                continue
+
+            # A. Download content
+            app.logger.info(f"Downloading file: {original_name}")
+            r = requests.get(download_link, stream=False, timeout=10)
+            r.raise_for_status()
+            file_content_bytes = r.content
+
+            # B. Secure Filename
+            filename_safe = secure_filename(original_name)
+            ext = filename_safe.rsplit('.', 1)[1].lower() if '.' in filename_safe else 'bin'
+            
+            if not allowed_file(f'dummy.{ext}'):
+                errors.append(f"{original_name}: File type not allowed")
+                continue
+
+            # C. Prepare for GitHub
+            unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
+            file_path_in_repo = f"uploads/{unique_filename}"
+            
+            content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
+            
+            api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
+            headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+            payload = {
+                "message": f"Upload RFQ file: {unique_filename}",
+                "content": content_b64,
+                "branch": branch
+            }
+            
+            # D. Upload
+            put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
+            put_response.raise_for_status()
+            
+            # E. Collect Success Path
+            # We return the path starting with /uploads/
+            needed_path = '/' + file_path_in_repo
+            uploaded_paths.append(needed_path)
+
+        except Exception as e:
+            app.logger.error(f"Failed to upload {original_name}: {e}")
+            errors.append(f"{original_name}: {str(e)}")
+
+    # 4. Return result
+    if not uploaded_paths and errors:
+        return jsonify({"message": "All uploads failed", "errors": errors}), 500
+
+    return jsonify({
+        "status": "success",
+        "message": f"Uploaded {len(uploaded_paths)} files.",
+        "file_paths": uploaded_paths,  # <--- Now returning an ARRAY
+        "errors": errors
+    }), 200
   
 
 
