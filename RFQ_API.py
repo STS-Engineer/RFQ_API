@@ -15,7 +15,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_mail import Mail, Message
 from werkzeug.utils import secure_filename
 from decimal import Decimal
-
+from openai import OpenAI
 
 
 
@@ -2458,94 +2458,163 @@ def check_groupe_existence():
 
 
 
+
+
+# Initialize OpenAI Client (ensure OPENAI_API_KEY is in your environment)
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# Updated allowed extensions per your requirements
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf', 'txt', 'csv', 'xlsx', 'docx', 'pptx', 'md', 'json'}
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def download_from_openai_file_id(file_id):
+    """Downloads file bytes from OpenAI Files API using file_id."""
+    try:
+        print(f"⬇️ Downloading from OpenAI file_id: {file_id}")
+        response = client.files.content(file_id)
+        return response.read()
+    except Exception as e:
+        raise RuntimeError(f"OpenAI download failed for {file_id}: {e}")
+
+def upload_bytes_to_github(file_content_bytes, filename, is_drawing=False, folder_path="uploads"):
+    """
+    Uploads raw bytes to GitHub with optional 'Drawing_' prefix.
+    """
+    try:
+        token = os.environ.get("GITHUB_TOKEN")
+        # Using the repo from your latest snippet
+        repo_full_name = "STS-Engineer/AVOchatbot-backend" 
+        branch = "main"
+        
+        if not token:
+            return {"success": False, "error": "GITHUB_TOKEN not set"}
+
+        content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
+
+        # Updated Naming Logic: UUID + Timestamp + Drawing Prefix if applicable
+        prefix = "Drawing_" if is_drawing else ""
+        unique_filename = f"{prefix}{uuid.uuid4().hex[:8]}_{int(time.time())}_{filename}"
+        file_path_in_repo = f"{folder_path}/{unique_filename}"
+        
+        api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        
+        payload = {
+            "message": f"Upload attachment: {unique_filename}",
+            "content": content_b64,
+            "branch": branch
+        }
+
+        response = requests.put(api_url, headers=headers, json=payload, timeout=20)
+        
+        if response.status_code in [200, 201]:
+            data = response.json()
+            return {
+                "success": True,
+                "path": "/" + file_path_in_repo, # Return with leading slash for /api/send-report
+                "raw_url": data.get('content', {}).get('download_url')
+            }
+        else:
+            return {"success": False, "error": f"GitHub {response.status_code}: {response.text}"}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 @app.route('/api/upload-file', methods=['POST'])
 def upload_file():
-    # 1. Get the list of file references and the new is_drawing field
+    """
+    1. Receives list of file references (OpenAI refs) and is_drawing flag.
+    2. Downloads content via Link or File ID.
+    3. Uploads to GitHub with optional 'Drawing_' prefix.
+    """
     data = request.get_json(silent=True) or {}
     refs = data.get('openaiFileIdRefs', [])
-    is_drawing = data.get('is_drawing', False)  # New boolean field
-    
+    is_drawing = data.get('is_drawing', False) # Capture the drawing flag
+
     if not refs:
-        return jsonify({
-            "message": "No openaiFileIdRefs in JSON request",
-            "received_content_type": request.content_type
-        }), 400
-    
-    # 2. Load Configuration
-    token = os.environ.get('GITHUB_TOKEN')
-    repo_full_name = "STS-Engineer/RFQ-back"
-    branch = "main"
+        return jsonify({"message": "No openaiFileIdRefs provided"}), 400
 
-    if not token or not repo_full_name:
-        app.logger.error("GitHub configuration (GITHUB_TOKEN, GITHUB_REPO) is missing.")
-        return jsonify({"message": "Server configuration error: GitHub token/repo not set"}), 500
-
-    uploaded_paths = []
+    uploaded_results = []
+    file_paths_for_report = [] # To maintain compatibility with existing send-report logic
     errors = []
 
-    # 3. Loop through ALL files in the request
     for file_ref in refs:
         try:
+            # --- Normalize input ---
             if isinstance(file_ref, dict):
-                download_link = file_ref.get('download_link')
-                original_name = file_ref.get('name') or 'uploaded_file'
+                file_id = file_ref.get("id")
+                download_link = file_ref.get("download_link")
+                original_name = file_ref.get("name") or "uploaded_file"
             else:
-                download_link = file_ref
-                original_name = 'uploaded_file'
+                file_id = file_ref
+                download_link = None
+                original_name = "uploaded_file"
 
-            if not download_link:
+            # --- Download bytes (LINK → FILE_ID fallback) ---
+            file_bytes = None
+            if download_link:
+                try:
+                    r = requests.get(download_link, timeout=15)
+                    r.raise_for_status()
+                    file_bytes = r.content
+                except Exception as e:
+                    print(f"⚠️ download_link failed, falling back to file_id: {e}")
+
+            if file_bytes is None and file_id:
+                file_bytes = download_from_openai_file_id(file_id)
+            
+            if file_bytes is None:
+                errors.append(f"{original_name}: No valid download source found")
                 continue
 
-            # A. Download content
-            r = requests.get(download_link, stream=False, timeout=10)
-            r.raise_for_status()
-            file_content_bytes = r.content
-
-            # B. Secure Filename and Extension
+            # --- Filename & validation ---
             filename_safe = secure_filename(original_name)
-            ext = filename_safe.rsplit('.', 1)[1].lower() if '.' in filename_safe else 'bin'
-            
-            if not allowed_file(f'dummy.{ext}'):
+            if '.' not in filename_safe:
+                filename_safe += ".bin"
+
+            if not allowed_file(filename_safe):
                 errors.append(f"{original_name}: File type not allowed")
                 continue
 
-            # C. Updated Filename Logic: Add "Drawing_" prefix if is_drawing is True
-            prefix = "Drawing_" if is_drawing else ""
-            unique_filename = f"{prefix}rfq_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
-            
-            file_path_in_repo = f"uploads/{unique_filename}"
-            content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
-            
-            api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
-            headers = {
-                "Authorization": f"token {token}",
-                "Accept": "application/vnd.github.v3+json",
-            }
-            payload = {
-                "message": f"Upload RFQ file: {unique_filename}",
-                "content": content_b64,
-                "branch": branch
-            }
-            
-            # D. Upload to GitHub
-            put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
-            put_response.raise_for_status()
-            
-            uploaded_paths.append('/' + file_path_in_repo)
+            # --- Upload to GitHub using the helper ---
+            gh_result = upload_bytes_to_github(
+                file_bytes,
+                filename_safe,
+                is_drawing=is_drawing,
+                folder_path="uploads"
+            )
+
+            if not gh_result["success"]:
+                errors.append(f"{original_name}: {gh_result['error']}")
+                continue
+
+            uploaded_results.append({
+                "original_name": original_name,
+                "path": gh_result["path"],
+                "url": gh_result["raw_url"]
+            })
+            file_paths_for_report.append(gh_result["path"])
 
         except Exception as e:
-            app.logger.error(f"Failed to upload {original_name}: {e}")
             errors.append(f"{original_name}: {str(e)}")
+
+    if not uploaded_results and errors:
+        return jsonify({"success": False, "message": "All uploads failed", "errors": errors}), 500
 
     return jsonify({
         "status": "success",
-        "message": f"Uploaded {len(uploaded_paths)} files.",
-        "file_paths": uploaded_paths,
+        "message": f"Processed {len(uploaded_results)} files.",
+        "file_paths": file_paths_for_report, # Keep this for the Assistant to pass to Step 2
+        "files": uploaded_results,
         "is_drawing_processed": is_drawing,
         "errors": errors
     }), 200
-  
-
 
 
 @app.route('/api/rfq/update/<string:rfq_id>', methods=['POST', 'PUT'])
