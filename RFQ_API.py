@@ -246,9 +246,9 @@ def validate_bulk_enrich_request(data: dict) -> tuple:
     }
     
     return True, None, validated
-# ------------------------ Apollo Client ------------------------
-class ApolloClient:
-    """Client for Apollo.io API"""
+# ------------------------ Apollo  ------------------------
+class Apollo:
+    """ for Apollo.io API"""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
@@ -289,15 +289,15 @@ class ApolloClient:
         return response.json()
 
 # ------------------------ Helpers ------------------------
-def get_apollo_client(api_key: Optional[str] = None) -> ApolloClient:
+def get_apollo_(api_key: Optional[str] = None) -> Apollo:
     """
     Use provided key if ALLOW_HEADER_OVERRIDE=true, otherwise use environment key.
     """
     if ALLOW_HEADER_OVERRIDE and api_key:
-        return ApolloClient(api_key)
+        return Apollo(api_key)
     if not ENV_API_KEY:
         raise RuntimeError("APOLLO_API_KEY is not set. Add it to your environment variables.")
-    return ApolloClient(ENV_API_KEY)
+    return Apollo(ENV_API_KEY)
 
 # --- 2. DATABASE CONNECTION UTILITY ---
 def get_db():
@@ -511,7 +511,7 @@ def _monday_query(query: str, variables: dict | None = None) -> dict:
 def get_user_id_by_email(email: str) -> int | None:
     """
     Resolve a monday user ID from an email.
-    We fetch pages of users and match email client-side to avoid schema changes.
+    We fetch pages of users and match email -side to avoid schema changes.
     """
     page = 1
     while True:
@@ -1417,7 +1417,7 @@ def search_people_simple():
         return jsonify({"status": "error", "message": error_msg}), 400
 
     try:
-        client = get_apollo_client(x_api_key)
+         = get_apollo_(x_api_key)
     except RuntimeError as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
@@ -1442,7 +1442,7 @@ def search_people_simple():
             if req["q_organization_domains"]:
                 payload["q_organization_domains"] = req["q_organization_domains"]
 
-            response_data = client.search_single_organization(payload)
+            response_data = .search_single_organization(payload)
 
             contacts = response_data.get("contacts", []) or response_data.get("people", [])
             
@@ -1534,8 +1534,8 @@ def enrich_person():
         payload["webhook_url"] = req["webhook_url"]
 
     try:
-        client = get_apollo_client(x_api_key)
-        response_data = client.enrich_person(payload)
+         = get_apollo_(x_api_key)
+        response_data = .enrich_person(payload)
         
         # ✅ FILTER RESPONSE HERE
         filtered_response = filter_enrich_contact(response_data)
@@ -1575,7 +1575,7 @@ def bulk_enrich_people():
         }), 400
 
     try:
-        client = get_apollo_client(x_api_key)
+         = get_apollo_client(x_api_key)
         response_data = client.bulk_enrich(payload)
 
         # matches peut contenir des dicts ET/OU des None -> filtrage tolérant
@@ -2486,7 +2486,7 @@ def upload_bytes_to_github(file_content_bytes, filename, is_drawing=False, folde
     try:
         token = os.environ.get("GITHUB_TOKEN")
         # Using the repo from your latest snippet
-        repo_full_name = "STS-Engineer/AVOchatbot-backend" 
+        repo_full_name = "STS-Engineer/RFQ_API" 
         branch = "main"
         
         if not token:
