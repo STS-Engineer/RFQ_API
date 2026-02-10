@@ -2460,9 +2460,10 @@ def check_groupe_existence():
 
 @app.route('/api/upload-file', methods=['POST'])
 def upload_file():
-    # 1. Get the list of file references
+    # 1. Get the list of file references and the new is_drawing field
     data = request.get_json(silent=True) or {}
     refs = data.get('openaiFileIdRefs', [])
+    is_drawing = data.get('is_drawing', False)  # New boolean field
     
     if not refs:
         return jsonify({
@@ -2485,7 +2486,6 @@ def upload_file():
     # 3. Loop through ALL files in the request
     for file_ref in refs:
         try:
-            # Handle dictionary vs string format
             if isinstance(file_ref, dict):
                 download_link = file_ref.get('download_link')
                 original_name = file_ref.get('name') or 'uploaded_file'
@@ -2497,12 +2497,11 @@ def upload_file():
                 continue
 
             # A. Download content
-            app.logger.info(f"Downloading file: {original_name}")
             r = requests.get(download_link, stream=False, timeout=10)
             r.raise_for_status()
             file_content_bytes = r.content
 
-            # B. Secure Filename
+            # B. Secure Filename and Extension
             filename_safe = secure_filename(original_name)
             ext = filename_safe.rsplit('.', 1)[1].lower() if '.' in filename_safe else 'bin'
             
@@ -2510,10 +2509,11 @@ def upload_file():
                 errors.append(f"{original_name}: File type not allowed")
                 continue
 
-            # C. Prepare for GitHub
-            unique_filename = f"rfq_upload_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
-            file_path_in_repo = f"uploads/{unique_filename}"
+            # C. Updated Filename Logic: Add "Drawing_" prefix if is_drawing is True
+            prefix = "Drawing_" if is_drawing else ""
+            unique_filename = f"{prefix}rfq_{uuid.uuid4().hex[:8]}_{int(time.time())}.{ext}"
             
+            file_path_in_repo = f"uploads/{unique_filename}"
             content_b64 = base64.b64encode(file_content_bytes).decode('utf-8')
             
             api_url = f"https://api.github.com/repos/{repo_full_name}/contents/{file_path_in_repo}"
@@ -2527,27 +2527,21 @@ def upload_file():
                 "branch": branch
             }
             
-            # D. Upload
+            # D. Upload to GitHub
             put_response = requests.put(api_url, headers=headers, json=payload, timeout=20)
             put_response.raise_for_status()
             
-            # E. Collect Success Path
-            # We return the path starting with /uploads/
-            needed_path = '/' + file_path_in_repo
-            uploaded_paths.append(needed_path)
+            uploaded_paths.append('/' + file_path_in_repo)
 
         except Exception as e:
             app.logger.error(f"Failed to upload {original_name}: {e}")
             errors.append(f"{original_name}: {str(e)}")
 
-    # 4. Return result
-    if not uploaded_paths and errors:
-        return jsonify({"message": "All uploads failed", "errors": errors}), 500
-
     return jsonify({
         "status": "success",
         "message": f"Uploaded {len(uploaded_paths)} files.",
-        "file_paths": uploaded_paths,  # <--- Now returning an ARRAY
+        "file_paths": uploaded_paths,
+        "is_drawing_processed": is_drawing,
         "errors": errors
     }), 200
   
