@@ -2486,7 +2486,7 @@ def upload_bytes_to_github(file_content_bytes, filename, is_drawing=False, folde
     try:
         token = os.environ.get("GITHUB_TOKEN")
         # Using the repo from your latest snippet
-        repo_full_name = "STS-Engineer/RFQ_API" 
+        repo_full_name = "STS-Engineer/RFQ-back" 
         branch = "main"
         
         if not token:
