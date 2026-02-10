@@ -3,3 +3,4 @@ psycopg2-binary
 Flask-Mail
 requests
 openai
+python-dotenv
