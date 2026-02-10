@@ -2,3 +2,4 @@ Flask
 psycopg2-binary
 Flask-Mail
 requests
+openai
